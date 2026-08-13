@@ -1,0 +1,7 @@
+# personal/runtime files — never publish these
+prodtop.toml
+prodtop-state.json
+closed-agents.md
+__pycache__/
+*.pyc
+.claude/

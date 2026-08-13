@@ -1,0 +1,54 @@
+# prodtop configuration — copy to prodtop.toml and edit.
+# Projects are auto-discovered: any first-level directory under a root that
+# contains files modified within `window_days` shows up in the list.
+
+[settings]
+window_days = 3        # discovery window: projects with file activity in the last N days
+local_interval = 45    # seconds between local scans
+remote_interval = 60   # seconds between ssh scans
+excludes = [
+  ".git", "node_modules", ".venv", "venv", "__pycache__",
+  ".cache", ".next", "dist", "build", "target", ".pytest_cache",
+  ".mypy_cache", ".ruff_cache", ".DS_Store",
+]
+
+[agents]
+# Coding-agent CLIs to look for in terminals (matched against process args).
+process_names = ["claude", "codex", "chatgpt", "aider", "gemini", "goose"]
+idle_after = 600       # no terminal output for this many seconds -> "stalled"
+nudge = "continue"     # what gets typed (+ Enter) into a prodded agent
+
+# CAUTION with the next two. auto_prod nudges every stalled agent without
+# asking — an agent waiting for YOUR input looks identical to a stalled one.
+# approve_prompts answers "Would you like to run this command?" menus with
+# the default "Yes, proceed" — i.e. it approves whatever the agent proposed.
+auto_prod = false
+approve_prompts = false
+prod_cooldown = 900    # min seconds between prods of the same agent
+
+# tmux session names (glob patterns) that are NEVER prodded, closed, or
+# reopened — for sessions managed by some other system.
+protected = []
+
+# Detect Chrome tabs with AI chats open and list them as proddable rows.
+# Web prods are manual-only ([p]) and need Chrome's
+# View > Developer > Allow JavaScript from Apple Events enabled.
+web_prod = true
+[agents.web_sites]
+"claude.ai" = "claude-web"
+"chatgpt.com" = "chatgpt-web"
+"chat.openai.com" = "chatgpt-web"
+"gemini.google.com" = "gemini-web"
+
+[[hosts]]
+name = "local"
+local = true
+roots = ["~/Projects"]
+
+# Remote hosts are scanned over ssh (one find(1) round-trip per interval,
+# multiplexed connection). "ssh" is an alias from your ~/.ssh/config.
+[[hosts]]
+name = "server1"
+ssh = "server1"
+roots = ["/home/me/projects"]
+enabled = false
