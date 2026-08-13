@@ -1531,12 +1531,19 @@ def gather_rows(state, lock, sort_by, idle_after, policies):
     return projects, hosts, agents
 
 
-def draw(scr, state, lock, sel, sort_by, agent_cfg, ui_msg, policies):
+def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies):
     now = time.time()
     idle_after = agent_cfg["idle_after"]
     scr.erase()
     h, w = scr.getmaxyx()
     projects, hosts, agents = gather_rows(state, lock, sort_by, idle_after, policies)
+    # selection follows the project, not the list index — rows re-sort on
+    # every refresh, and a positional cursor would land keys on the wrong row
+    if sel_key is not None:
+        for i, p in enumerate(projects):
+            if (p.host, row_path(p)) == sel_key:
+                sel = i
+                break
 
     def put(y, x, text, attr=0):
         if 0 <= y < h and x < w:
@@ -1562,9 +1569,9 @@ def draw(scr, state, lock, sel, sort_by, agent_cfg, ui_msg, policies):
     clock = time.strftime("%H:%M:%S")
     put(0, max(x + 2 + len(ag_lbl) + 2, w - len(clock) - 1), clock, curses.color_pair(3))
     auto = "on" if agent_cfg["auto_prod"] else "off"
-    put(1, 0, f" sort: {sort_by}  auto-prod: {auto}   [p] prod  [i] leave alone  "
-              f"[a] re-arm  [x] close+save  [o] reopen detached  [s] sort  "
-              f"[r] rescan  [q] quit",
+    put(1, 0, f" sort: {sort_by}  auto-prod: {auto}   [p] prod now  "
+              f"[a] MODE→PROD  [i] MODE→leave  [x] close+save  "
+              f"[o] reopen detached  [s] sort  [r] rescan  [q] quit",
         curses.color_pair(3))
 
     # column layout
@@ -1687,6 +1694,7 @@ def tui(cfg):
             curses.init_pair(i, c, -1)
         scr.timeout(500)
         sel = 0
+        sel_key = None      # (host, row_path) of the selected row
         sort_by = "recency"
         pending = None      # ("close"|"reopen", agent)
 
@@ -1705,8 +1713,10 @@ def tui(cfg):
 
         while True:
             ui_msg = msgs[-1] if msgs else ""
-            sel, rows = draw(scr, state, lock, sel, sort_by, cfg["agents"],
-                             ui_msg, policies)
+            sel, rows = draw(scr, state, lock, sel, sel_key, sort_by,
+                             cfg["agents"], ui_msg, policies)
+            if rows:
+                sel_key = (rows[sel].host, row_path(rows[sel]))
             if cfg["agents"]["auto_prod"] and time.time() - last_auto > 10:
                 last_auto = time.time()
                 with lock:
@@ -1730,8 +1740,12 @@ def tui(cfg):
                 break
             elif ch in (ord("j"), curses.KEY_DOWN):
                 sel = min(sel + 1, max(0, len(rows) - 1))
+                if rows:
+                    sel_key = (rows[sel].host, row_path(rows[sel]))
             elif ch in (ord("k"), curses.KEY_UP):
                 sel = max(sel - 1, 0)
+                if rows:
+                    sel_key = (rows[sel].host, row_path(rows[sel]))
             elif ch == ord("s"):
                 sort_by = "24h" if sort_by == "recency" else "recency"
             elif ch == ord("r"):
@@ -1748,7 +1762,7 @@ def tui(cfg):
                 p = rows[sel]
                 policies[f"{p.host}|{row_path(p)}"] = "ignore"
                 save_policies(cfg, policies)
-                msgs.append(f"{p.name}: leave alone (no prods, incl. future agents)")
+                msgs.append(f"{p.name}: MODE = leave (never prodded)")
             elif ch == ord("a") and rows:
                 p = rows[sel]
                 key = f"{p.host}|{row_path(p)}"
@@ -1758,7 +1772,7 @@ def tui(cfg):
                 if match_policy(p.host, row_path(p), policies) != "auto":
                     policies[key] = "auto"
                 save_policies(cfg, policies)
-                msgs.append(f"{p.name}: PRODDING enabled")
+                msgs.append(f"{p.name}: MODE = PROD (stalled agents here get prodded)")
             elif ch == ord("x"):
                 p, a = sel_agent(rows)
                 if a and a.protected:
