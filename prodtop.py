@@ -27,6 +27,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import webbrowser
@@ -366,6 +367,7 @@ def load_config(path):
     r.setdefault("telegram_chat_id", "")
     r.setdefault("whatsapp_phone", "")
     r.setdefault("whatsapp_apikey", "")
+    r.setdefault("imessage_handle", "")
     r.setdefault("menu_idle", 90)       # agent quiet this long + menu on screen -> notify
     r.setdefault("remote_timeout", 300)  # hold auto-approve this long awaiting a phone answer
     a.setdefault("auto_prod", False)
@@ -977,6 +979,85 @@ def wa_notify(phone, apikey, text):
         pass
 
 
+IMSG_DB = Path.home() / "Library/Messages/chat.db"
+
+OSA_IMSG_SEND = '''
+on run argv
+  set theHandle to item 1 of argv
+  set theText to item 2 of argv
+  tell application "Messages"
+    set s to 1st account whose service type = iMessage
+    send theText to participant theHandle of s
+  end tell
+  return "ok"
+end run
+'''
+
+
+def imsg_send(handle, text):
+    try:
+        r = subprocess.run(["osascript", "-", handle, text],
+                           input=OSA_IMSG_SEND, capture_output=True,
+                           text=True, timeout=20)
+        return r.stdout.strip() == "ok"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def imsg_extract_text(text, blob):
+    """Message text; newer macOS stores it only in the attributedBody
+    NSKeyedArchiver blob — extract the embedded NSString payload."""
+    if text:
+        return text
+    if not blob:
+        return ""
+    i = blob.find(b"NSString")
+    if i < 0:
+        return ""
+    i += len(b"NSString") + 5      # skip archiver marker bytes
+    if i >= len(blob):
+        return ""
+    ln = blob[i]
+    if ln == 0x81:
+        ln = int.from_bytes(blob[i + 1:i + 3], "little")
+        i += 3
+    else:
+        i += 1
+    return blob[i:i + ln].decode("utf-8", "ignore")
+
+
+def imsg_connect():
+    return sqlite3.connect(f"file:{IMSG_DB}?mode=ro", uri=True, timeout=2)
+
+
+def imsg_max_rowid():
+    """Highest message ROWID, or None if chat.db is unreadable (no Full
+    Disk Access for the terminal app)."""
+    try:
+        con = imsg_connect()
+        rid = con.execute("SELECT COALESCE(MAX(ROWID),0) FROM message").fetchone()[0]
+        con.close()
+        return rid
+    except sqlite3.Error:
+        return None
+
+
+def imsg_poll(handle, last_rowid):
+    """New messages in the chat with `handle` since last_rowid."""
+    try:
+        con = imsg_connect()
+        rows = con.execute(
+            "SELECT m.ROWID, m.text, m.attributedBody FROM message m "
+            "JOIN chat_message_join j ON j.message_id = m.ROWID "
+            "JOIN chat c ON c.ROWID = j.chat_id "
+            "WHERE c.chat_identifier = ? AND m.ROWID > ? ORDER BY m.ROWID",
+            (handle, last_rowid)).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return []
+    return [(rid, imsg_extract_text(txt, blob)) for rid, txt, blob in rows]
+
+
 class RemoteAnswerer(threading.Thread):
     """Watches quiet agents for on-screen choice menus, pushes them to
     Telegram (buttons) and optionally WhatsApp (notify-only), and types
@@ -991,6 +1072,8 @@ class RemoteAnswerer(threading.Thread):
         self.offset = 0
         self.notified, self.last_check = {}, {}
         self.last_target = None
+        self.imsg_rowid = None
+        self.own_texts = deque(maxlen=30)   # texts we sent to the self-chat
         self.stop = False
 
     def run(self):
@@ -1006,9 +1089,15 @@ class RemoteAnswerer(threading.Thread):
         return tg_api(self.rc["telegram_token"], method, payload)
 
     def _say(self, text):
-        if self.rc["telegram_chat_id"]:
+        if self.rc["telegram_token"] and self.rc["telegram_chat_id"]:
             self._tg("sendMessage", {"chat_id": self.rc["telegram_chat_id"],
                                      "text": text})
+        self._imsg(text)
+
+    def _imsg(self, text):
+        if self.rc["imessage_handle"]:
+            self.own_texts.append(text)
+            imsg_send(self.rc["imessage_handle"], text)
 
     def check_menus(self):
         with self.lock:
@@ -1040,18 +1129,20 @@ class RemoteAnswerer(threading.Thread):
             buttons = [{"text": o, "callback_data": f"{a.host}|{a.tty}|{o}"}
                        for o in opts]
             buttons.append({"text": "esc", "callback_data": f"{a.host}|{a.tty}|esc"})
-            if self.rc["telegram_chat_id"]:
+            if self.rc["telegram_token"] and self.rc["telegram_chat_id"]:
                 self._tg("sendMessage",
                          {"chat_id": self.rc["telegram_chat_id"], "text": text,
                           "reply_markup": {"inline_keyboard": [buttons]}})
+            self._imsg(text + f"\n(reply {'/'.join(opts)} or esc)")
             if self.rc["whatsapp_phone"] and self.rc["whatsapp_apikey"]:
                 wa_notify(self.rc["whatsapp_phone"], self.rc["whatsapp_apikey"],
-                          text + "\n(answer via Telegram)")
+                          text + "\n(answer via Telegram/iMessage)")
             self.msgs.append(f"📱 prompt of {a.name}/{proj} sent to phone")
 
     def poll_replies(self):
+        self.poll_imessage()
         if not (self.rc["telegram_token"] and self.rc["telegram_chat_id"]):
-            time.sleep(15)
+            time.sleep(6 if self.rc["imessage_handle"] else 15)
             return
         ups = tg_api(self.rc["telegram_token"], "getUpdates",
                      {"offset": self.offset, "timeout": 20}, timeout=40)
@@ -1078,6 +1169,28 @@ class RemoteAnswerer(threading.Thread):
                     continue
                 result = self.answer(*self.last_target, txt)
                 self._say(result)
+
+    def poll_imessage(self):
+        handle = self.rc["imessage_handle"]
+        if not handle:
+            return
+        if self.imsg_rowid is None:
+            self.imsg_rowid = imsg_max_rowid()
+            if self.imsg_rowid is None:
+                self.msgs.append("iMessage: can't read chat.db — grant your "
+                                 "terminal Full Disk Access")
+                self.rc["imessage_handle"] = ""   # stop retrying this run
+            return
+        for rid, txt in imsg_poll(handle, self.imsg_rowid):
+            self.imsg_rowid = max(self.imsg_rowid, rid)
+            txt = (txt or "").strip()
+            # the self-chat echoes our own notifications — skip them
+            if not txt or txt in self.own_texts or txt[:1] in ("🤖", "✓", "✅"):
+                continue
+            if self.last_target is None:
+                self._imsg("no pending prompt to answer")
+                continue
+            self._imsg(self.answer(*self.last_target, txt))
 
     def answer(self, host, tty, choice):
         with self.lock:
@@ -1557,7 +1670,8 @@ def tui(cfg):
     policies = load_policies(cfg)
     pending_remote = {}
     remote_thread = None
-    if cfg["remote"]["enabled"] and cfg["remote"]["telegram_token"]:
+    if cfg["remote"]["enabled"] and (cfg["remote"]["telegram_token"]
+                                     or cfg["remote"]["imessage_handle"]):
         remote_thread = RemoteAnswerer(cfg, state, lock, msgs,
                                        pending_remote, policies)
         remote_thread.start()
@@ -1637,7 +1751,12 @@ def tui(cfg):
                 msgs.append(f"{p.name}: leave alone (no prods, incl. future agents)")
             elif ch == ord("a") and rows:
                 p = rows[sel]
-                policies.pop(f"{p.host}|{row_path(p)}", None)
+                key = f"{p.host}|{row_path(p)}"
+                policies.pop(key, None)
+                # a broader prefix policy (e.g. a whole-home "leave") may
+                # still match — pin an explicit auto so most-specific wins
+                if match_policy(p.host, row_path(p), policies) != "auto":
+                    policies[key] = "auto"
                 save_policies(cfg, policies)
                 msgs.append(f"{p.name}: PRODDING enabled")
             elif ch == ord("x"):
@@ -1871,6 +1990,27 @@ def setup_wizard(cfg, config_path):
             wa_notify(phone, key, "prodtop: WhatsApp notifications connected ✅")
             print("  ✓ test ping sent (check WhatsApp)")
 
+    # ---- iMessage
+    im = input("\nAdd iMessage? Two-way, no extra apps — prodtop messages "
+               "your own number and reads replies locally. [y/N] ").strip().lower()
+    if im in ("y", "yes"):
+        handle = input("Your iMessage handle (the phone number or Apple ID "
+                       "email you message yourself with, e.g. +41791234567): "
+                       ).strip()
+        if handle:
+            if imsg_send(handle, "✅ prodtop iMessage connected"):
+                print("  ✓ test message sent")
+            else:
+                print("  ✗ send failed — is Messages signed in? "
+                      "(saving anyway; retest with --test-remote)")
+            if imsg_max_rowid() is None:
+                print("  ⚠ cannot read replies yet: grant your terminal app "
+                      "Full Disk Access\n    (System Settings → Privacy & "
+                      "Security → Full Disk Access), then restart it")
+            else:
+                print("  ✓ reply reading OK")
+            values["imessage_handle"] = handle
+
     if values:
         values["enabled"] = True
         set_remote_config(config_path, values)
@@ -1916,6 +2056,17 @@ def test_remote(cfg):
         print("WhatsApp: test message sent (via CallMeBot)")
     else:
         print("WhatsApp: not configured (optional; see prodtop.toml [remote])")
+    if rc["imessage_handle"]:
+        ok = imsg_send(rc["imessage_handle"], "✅ prodtop iMessage connected")
+        print(f"iMessage: {'test message sent' if ok else 'send FAILED'}")
+        if imsg_max_rowid() is None:
+            print("iMessage: cannot read replies — grant your terminal app "
+                  "Full Disk Access\n  (System Settings → Privacy & Security "
+                  "→ Full Disk Access)")
+        else:
+            print("iMessage: reply reading OK (Full Disk Access granted)")
+    else:
+        print("iMessage: not configured (optional; see prodtop.toml [remote])")
 
 
 if __name__ == "__main__":

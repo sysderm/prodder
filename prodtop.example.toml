@@ -60,6 +60,11 @@ telegram_token = ""    # NEVER commit real tokens — this file is a template
 telegram_chat_id = ""
 whatsapp_phone = ""
 whatsapp_apikey = ""
+# iMessage (two-way, Mac+iPhone, no extra apps): your own phone number or
+# Apple ID email — prodtop messages your self-chat via Messages.app and reads
+# replies from the local Messages database (your terminal app needs Full Disk
+# Access: System Settings -> Privacy & Security -> Full Disk Access).
+imessage_handle = ""
 menu_idle = 90         # agent quiet this long with a menu on screen -> notify
 remote_timeout = 300   # hold auto-approve while waiting for your answer
 
