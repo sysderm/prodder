@@ -25,9 +25,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import webbrowser
 import threading
 import time
 import tomllib
@@ -1718,7 +1720,17 @@ def main():
                     help="print one snapshot as plain text and exit")
     ap.add_argument("--test-remote", action="store_true",
                     help="test the Telegram/WhatsApp connection and exit")
+    ap.add_argument("--setup", action="store_true",
+                    help="guided setup for phone answering (Telegram/WhatsApp)")
     args = ap.parse_args()
+    if args.setup:
+        if not os.path.exists(args.config):
+            example = Path(__file__).parent / "prodtop.example.toml"
+            if example.exists():
+                shutil.copy(example, args.config)
+                print(f"created {args.config} from the template")
+        setup_wizard(load_config(args.config), args.config)
+        return
     if not os.path.exists(args.config):
         example = Path(__file__).parent / "prodtop.example.toml"
         if example.exists():
@@ -1732,6 +1744,140 @@ def main():
         once(cfg)
     else:
         tui(cfg)
+
+
+def set_remote_config(path, values):
+    """Update keys inside the [remote] section of the config file, preserving
+    all other content and comments. Appends the section if missing."""
+    text = Path(path).read_text()
+
+    def fmt(v):
+        return json.dumps(v) if isinstance(v, str) else \
+            ("true" if v is True else "false" if v is False else str(v))
+
+    if "[remote]" not in text:
+        text += ("\n[remote]\n"
+                 + "".join(f"{k} = {fmt(v)}\n" for k, v in values.items()))
+    else:
+        start = text.index("[remote]")
+        nxt = re.search(r"(?m)^\[", text[start + 1:])
+        end = start + 1 + nxt.start() if nxt else len(text)
+        seg = text[start:end]
+        for k, v in values.items():
+            if re.search(rf"(?m)^\s*{k}\s*=", seg):
+                seg = re.sub(rf"(?m)^(\s*{k}\s*=\s*)[^#\n]*",
+                             lambda m: m.group(1) + fmt(v) + "   ",
+                             seg, count=1)
+            else:
+                seg = seg.replace("[remote]", f"[remote]\n{k} = {fmt(v)}", 1)
+        text = text[:start] + seg + text[end:]
+    Path(path).write_text(text)
+
+
+def setup_wizard(cfg, config_path):
+    """Interactive one-paste-two-taps setup for Telegram (+ WhatsApp)."""
+    rc = cfg["remote"]
+    print("prodtop remote setup — Telegram (two-way) + optional WhatsApp "
+          "(notify-only)\n")
+    print("NOTE: quit any running prodtop first — its poller would swallow "
+          "the messages this setup waits for.\n")
+    values = {}
+
+    # ---- Telegram
+    tok = rc.get("telegram_token", "")
+    if tok:
+        keep = input("A Telegram bot token is already configured — keep it? "
+                     "[Y/n] ").strip().lower()
+        if keep in ("n", "no"):
+            tok = ""
+    if not tok:
+        print("STEP 1 — create your bot (Telegram is opening):")
+        print("   send @BotFather:  /newbot   then answer its two questions")
+        print("   (any display name; the username must end in 'bot')")
+        print("   link: https://t.me/BotFather")
+        try:
+            webbrowser.open("https://t.me/BotFather")
+        except Exception:
+            pass
+        tok = input("\nPaste the HTTP API token BotFather gave you "
+                    "(Enter = skip Telegram): ").strip()
+    if tok:
+        try:
+            me = tg_api(tok, "getMe", {})["result"]
+        except Exception as e:
+            print(f"  ✗ token check failed: {e}")
+            return
+        print(f"  ✓ token valid — bot @{me['username']}")
+        values["telegram_token"] = tok
+        chat = rc.get("telegram_chat_id", "") if tok == rc.get("telegram_token") else ""
+        if not chat:
+            link = f"https://t.me/{me['username']}"
+            print(f"STEP 2 — open your bot and press START (link: {link})")
+            try:
+                webbrowser.open(link)
+            except Exception:
+                pass
+            print("   waiting up to 120 s for your first message ...")
+            offset, deadline = 0, time.time() + 120
+            while time.time() < deadline and not chat:
+                try:
+                    ups = tg_api(tok, "getUpdates",
+                                 {"offset": offset, "timeout": 20}, timeout=40)
+                except Exception:
+                    break
+                for u in ups.get("result", []):
+                    offset = u["update_id"] + 1
+                    m = u.get("message")
+                    if m:
+                        chat = str(m["chat"]["id"])
+                        who = m.get("from", {}).get("first_name", "")
+                        print(f"  ✓ found you ({who}), chat id {chat}")
+                        break
+            if not chat:
+                print("  ✗ nothing received — token saved; rerun --setup "
+                      "to finish")
+        if chat:
+            values["telegram_chat_id"] = chat
+            try:
+                tg_api(tok, "sendMessage",
+                       {"chat_id": chat,
+                        "text": "✅ prodtop connected — decision menus will "
+                                "arrive here with answer buttons"})
+                print("  ✓ confirmation sent to your Telegram")
+            except Exception as e:
+                print(f"  test message failed: {e}")
+
+    # ---- WhatsApp
+    wa = input("\nAdd WhatsApp pings too? Outbound-only, via the third-party "
+               "callmebot.com (prompt text transits their server). "
+               "[y/N] ").strip().lower()
+    if wa in ("y", "yes"):
+        msg = urllib.parse.quote("I allow callmebot to send me messages")
+        link = f"https://wa.me/34644519523?text={msg}"
+        print("STEP 1 — WhatsApp is opening with a prefilled message to "
+              "CallMeBot — just press send.")
+        print(f"   link: {link}")
+        try:
+            webbrowser.open(link)
+        except Exception:
+            pass
+        print("   CallMeBot replies (usually within a minute) with an apikey.")
+        phone = input("Your WhatsApp number incl. country code "
+                      "(e.g. +41791234567): ").strip()
+        key = input("Paste the apikey CallMeBot sent you: ").strip()
+        if phone and key:
+            values["whatsapp_phone"] = phone
+            values["whatsapp_apikey"] = key
+            wa_notify(phone, key, "prodtop: WhatsApp notifications connected ✅")
+            print("  ✓ test ping sent (check WhatsApp)")
+
+    if values:
+        values["enabled"] = True
+        set_remote_config(config_path, values)
+        print(f"\n✓ saved to {config_path} — remote answering ENABLED.")
+        print("Start prodtop; agents' decision menus will now reach your phone.")
+    else:
+        print("\nnothing configured — config unchanged")
 
 
 def test_remote(cfg):

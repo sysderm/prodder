@@ -54,7 +54,9 @@ where every agent is sitting idle waiting for nothing.
   While a question is on your phone, auto-approve holds off
   (`remote_timeout`). Prompts matching `never_approve` patterns (`rm -rf`,
   `--force`, `sudo`, ...) are *never* auto-approved — those always wait for
-  a human. Setup: `./prodtop.py --test-remote` walks you through it.
+  a human. Setup is one paste and two taps: `./prodtop.py --setup` opens
+  the right chats, validates the token, auto-discovers your chat id, writes
+  the config, and sends test messages. (`--test-remote` re-checks later.)
 
 ## Install & run
 
@@ -65,6 +67,7 @@ git clone <repo> && cd prodtop
 cp prodtop.example.toml prodtop.toml   # edit roots/hosts
 ./prodtop.py            # TUI
 ./prodtop.py --once     # one plain-text snapshot
+./prodtop.py --setup    # guided phone-answering setup (Telegram/WhatsApp)
 ```
 
 Keys: `j`/`k` select · `p` prod · `i` leave alone · `a` re-arm ·

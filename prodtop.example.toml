@@ -53,8 +53,8 @@ web_prod = true
 # a numbered menu on screen, prodtop sends it to Telegram with answer buttons;
 # tapping one (or replying with text) types it into that terminal. Optional
 # WhatsApp pings are outbound-only (via the third-party callmebot.com — the
-# prompt text passes through it). Setup: @BotFather -> /newbot -> token here,
-# then ./prodtop.py --test-remote to discover your chat id.
+# prompt text passes through it). Easiest setup: ./prodtop.py --setup
+# (guided: opens the chats, validates, discovers your chat id, writes here).
 enabled = false
 telegram_token = ""    # NEVER commit real tokens — this file is a template
 telegram_chat_id = ""
