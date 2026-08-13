@@ -31,6 +31,8 @@ import sys
 import threading
 import time
 import tomllib
+import urllib.parse
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,48 +48,54 @@ SSH_BASE = [
 ]
 
 # Types text into a Terminal.app tab or iTerm2 session identified by its tty.
-# The Enter is sent SEPARATELY after a delay: TUI agents (claude/codex input
-# boxes) treat text+newline arriving in one burst as a paste and swallow the
-# Enter, leaving "continue" sitting unsubmitted in the prompt.
-OSA_TYPE = '''
+# argv: tty, text, withCR ("1"/"0"). Any Enter is sent SEPARATELY after a
+# delay, and as a real carriage return (0x0D): TUI agents (claude/codex input
+# boxes) treat text+newline arriving in one burst as a paste, and a plain
+# newline is a line feed that composers map to "insert newline" — either way
+# the nudge would sit unsubmitted in the prompt.
+OSA_SEND = '''
 on run argv
   set theTTY to item 1 of argv
   set theText to item 2 of argv
+  set withCR to item 3 of argv
   tell application "System Events"
     set hasTerm to (count of (processes whose name is "Terminal")) > 0
     set hasIterm to (count of (processes whose name is "iTerm2")) > 0
   end tell
-  if hasTerm then
-    tell application "Terminal"
-      repeat with w in windows
-        repeat with t in tabs of w
-          if (tty of t) is theTTY then
-            do script theText in t
-            delay 0.6
-            do script "" in t
-            return "ok"
-          end if
-        end repeat
-      end repeat
-    end tell
-  end if
   if hasIterm then
     tell application "iTerm2"
       repeat with w in windows
         repeat with tb in tabs of w
           repeat with s in sessions of tb
             if (tty of s) is theTTY then
-              tell s to write text theText newline NO
-              delay 0.6
-              -- must be a real carriage return (0x0D): a plain newline is a
-              -- line feed, which TUI composers map to "insert newline",
-              -- leaving the nudge sitting unsubmitted in the prompt
-              tell s to write text (character id 13) newline NO
-              delay 0.4
-              tell s to write text (character id 13) newline NO
+              if theText is not "" then
+                tell s to write text theText newline NO
+              end if
+              if withCR is "1" then
+                delay 0.6
+                tell s to write text (character id 13) newline NO
+                delay 0.4
+                tell s to write text (character id 13) newline NO
+              end if
               return "ok"
             end if
           end repeat
+        end repeat
+      end repeat
+    end tell
+  end if
+  if hasTerm then
+    tell application "Terminal"
+      repeat with w in windows
+        repeat with t in tabs of w
+          if (tty of t) is theTTY then
+            do script theText in t
+            if withCR is "1" then
+              delay 0.6
+              do script "" in t
+            end if
+            return "ok"
+          end if
         end repeat
       end repeat
     end tell
@@ -345,6 +353,19 @@ def load_config(path):
                                "chatgpt.com": "chatgpt-web",
                                "chat.openai.com": "chatgpt-web",
                                "gemini.google.com": "gemini-web"})
+    a.setdefault("never_approve", [
+        "rm -rf", "sudo ", "--force", "force push", "git push",
+        "DROP TABLE", "shutdown", "reboot", "mkfs", "diskutil erase",
+        "crontab -r", "launchctl unload",
+    ])
+    r = cfg.setdefault("remote", {})
+    r.setdefault("enabled", False)
+    r.setdefault("telegram_token", "")
+    r.setdefault("telegram_chat_id", "")
+    r.setdefault("whatsapp_phone", "")
+    r.setdefault("whatsapp_apikey", "")
+    r.setdefault("menu_idle", 90)       # agent quiet this long + menu on screen -> notify
+    r.setdefault("remote_timeout", 300)  # hold auto-approve this long awaiting a phone answer
     a.setdefault("auto_prod", False)
     a.setdefault("prod_cooldown", 900)
     a.setdefault("protected", [])
@@ -845,9 +866,58 @@ PROMPT_RX = re.compile(
     r"Yes, proceed|1\. Yes|Do you want to proceed|Would you like to run")
 
 
-def prod_agent(agent, nudge, approve_prompts=True):
+def send_to_terminal(agent, text, submit=True):
+    """Deliver text (and optionally a submitting Enter) to the agent's
+    terminal. text of "\\x1b" sends a bare Escape. Returns None on success,
+    an error string otherwise."""
+    try:
+        if agent.pane:
+            if text == "\x1b":
+                parts = [["send-keys", "-t", agent.pane, "Escape"]]
+            else:
+                parts = []
+                if text:
+                    parts.append(["send-keys", "-t", agent.pane, "-l", text])
+                if submit:
+                    parts.append(["send-keys", "-t", agent.pane, "Enter"])
+            if agent.ssh:
+                sock = shlex.quote(agent.sock)
+                cmd = " && sleep 0.6 && ".join(
+                    f"tmux -S {sock} " + " ".join(shlex.quote(x) for x in p)
+                    for p in parts)
+                r = subprocess.run(SSH_BASE + [agent.ssh, cmd],
+                                   capture_output=True, text=True, timeout=30)
+            else:
+                r = None
+                for i, p in enumerate(parts):
+                    if i:
+                        time.sleep(0.6)
+                    r = subprocess.run(["tmux"] + p, capture_output=True,
+                                       text=True, timeout=10)
+            if r is not None and r.returncode != 0:
+                return f"send failed: {r.stderr.strip()[:80]}"
+            return None
+        if not agent.ssh:
+            tty = agent.prod_tty or agent.tty
+            r = subprocess.run(
+                ["osascript", "-", tty, text, "1" if submit and text != "\x1b" else "0"],
+                input=OSA_SEND, capture_output=True, text=True, timeout=30)
+            res = r.stdout.strip()
+            if res == "ok":
+                return None
+            if res == "notfound":
+                return (f"no terminal tab owns {tty} — session is detached "
+                        f"(closed window?) or in an unscriptable terminal")
+            return f"send failed: {(r.stderr or res).strip()[:80]}"
+        return f"can't reach {agent.name} on {agent.host}: not in tmux"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"send failed: {e}"
+
+
+def prod_agent(agent, nudge, approve_prompts=True, never_approve=()):
     """Unstick an agent: if it is sitting on an approval prompt, press Enter
-    to accept the default "Yes"; otherwise type the nudge text + Enter."""
+    to accept the default "Yes"; otherwise type the nudge text + Enter.
+    Prompts matching a never_approve pattern are left for a human."""
     if agent.protected:
         return f"'{agent.tmux}' is a protected session — not prodding"
     if agent.web:
@@ -856,40 +926,172 @@ def prod_agent(agent, nudge, approve_prompts=True):
     if approve_prompts:
         tail = "\n".join(capture_screen(agent).splitlines()[-30:])
         if PROMPT_RX.search(tail):
+            low = tail.lower()
+            if any(p.lower() in low for p in never_approve):
+                return (f"{agent.name} prompt matches never_approve — "
+                        f"needs a human decision")
             text, verb = "", "approved prompt of"
+    err = send_to_terminal(agent, text, submit=True)
+    if err:
+        return err
+    where = f"tmux {agent.tmux}" if agent.pane else (agent.prod_tty or agent.tty)
+    return f"{verb} {agent.name} ({where}) on {agent.host}"
+
+
+# ------------------------------------------------------- remote answering
+
+MENU_OPT_RX = re.compile(r"^\s*[❯›>]?\s*([1-9])[\.\)]\s+\S")
+
+
+def extract_menu(screen):
+    """(menu_text, option_digits) if the screen shows a numbered choice menu."""
+    lines = [l.rstrip() for l in screen.splitlines() if l.strip()][-30:]
+    hits = [i for i, l in enumerate(lines) if MENU_OPT_RX.match(l)]
+    if len(hits) < 2:
+        return None, []
+    opts = sorted({MENU_OPT_RX.match(lines[i]).group(1) for i in hits})
+    start = max(0, hits[0] - 8)
+    return "\n".join(lines[start:hits[-1] + 2])[-1500:], opts
+
+
+def tg_api(token, method, payload=None, timeout=35):
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=json.dumps(payload or {}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def wa_notify(phone, apikey, text):
+    """Outbound-only WhatsApp ping via CallMeBot (third-party service — the
+    message text passes through it; keep it enabled only if that's OK)."""
+    q = urllib.parse.urlencode({"phone": phone, "apikey": apikey,
+                                "text": text[:800]})
     try:
-        if agent.pane:
-            if agent.ssh:
-                sock, pane = shlex.quote(agent.sock), shlex.quote(agent.pane)
-                typing = (f"tmux -S {sock} send-keys -t {pane} -l {shlex.quote(text)} && "
-                          f"sleep 0.6 && " if text else "")
-                cmd = typing + f"tmux -S {sock} send-keys -t {pane} Enter"
-                r = subprocess.run(SSH_BASE + [agent.ssh, cmd],
-                                   capture_output=True, text=True, timeout=30)
-            else:
-                if text:
-                    subprocess.run(["tmux", "send-keys", "-t", agent.pane, "-l", text],
-                                   capture_output=True, text=True, timeout=10)
-                    time.sleep(0.6)
-                r = subprocess.run(["tmux", "send-keys", "-t", agent.pane, "Enter"],
-                                   capture_output=True, text=True, timeout=10)
-            if r.returncode != 0:
-                return f"prod failed: {r.stderr.strip()[:80]}"
-            return f"{verb} {agent.name} (tmux {agent.tmux}) on {agent.host}"
-        if not agent.ssh:
-            tty = agent.prod_tty or agent.tty
-            r = subprocess.run(["osascript", "-", tty, text],
-                               input=OSA_TYPE, capture_output=True, text=True, timeout=25)
-            res = r.stdout.strip()
-            if res == "ok":
-                return f"{verb} {agent.name} ({tty}) on {agent.host}"
-            if res == "notfound":
-                return (f"no terminal tab owns {tty} — session is detached "
-                        f"(closed window?) or in an unscriptable terminal")
-            return f"prod failed: {(r.stderr or res).strip()[:80]}"
-        return f"can't prod {agent.name} on {agent.host}: not in tmux"
-    except (OSError, subprocess.SubprocessError) as e:
-        return f"prod failed: {e}"
+        urllib.request.urlopen(
+            f"https://api.callmebot.com/whatsapp.php?{q}", timeout=20).read()
+    except OSError:
+        pass
+
+
+class RemoteAnswerer(threading.Thread):
+    """Watches quiet agents for on-screen choice menus, pushes them to
+    Telegram (buttons) and optionally WhatsApp (notify-only), and types
+    answers back into the right terminal. Only the configured chat id is
+    obeyed."""
+
+    def __init__(self, cfg, state, lock, msgs, pending_remote, policies):
+        super().__init__(daemon=True)
+        self.rc, self.agent_cfg = cfg["remote"], cfg["agents"]
+        self.state, self.lock, self.msgs = state, lock, msgs
+        self.pending_remote, self.policies = pending_remote, policies
+        self.offset = 0
+        self.notified, self.last_check = {}, {}
+        self.last_target = None
+        self.stop = False
+
+    def run(self):
+        while not self.stop:
+            try:
+                self.check_menus()
+                self.poll_replies()     # long poll doubles as loop pacing
+            except Exception as e:
+                self.msgs.append(f"remote: {str(e)[:80]}")
+                time.sleep(15)
+
+    def _tg(self, method, payload):
+        return tg_api(self.rc["telegram_token"], method, payload)
+
+    def _say(self, text):
+        if self.rc["telegram_chat_id"]:
+            self._tg("sendMessage", {"chat_id": self.rc["telegram_chat_id"],
+                                     "text": text})
+
+    def check_menus(self):
+        with self.lock:
+            agents = [a for hs in self.state.values() for a in hs.agents]
+            apply_policies(agents, self.policies)
+        now = time.time()
+        for a in agents:
+            key = (a.host, a.tty)
+            if a.web or a.protected or a.policy == "ignore":
+                continue
+            if a.eff_idle() < self.rc["menu_idle"]:
+                self.notified.pop(key, None)
+                continue
+            if now - self.last_check.get(key, 0) < 60:
+                continue
+            self.last_check[key] = now
+            menu, opts = extract_menu(capture_screen(a))
+            if not menu:
+                continue
+            h = hash(menu)
+            if self.notified.get(key) == h:
+                continue
+            self.notified[key] = h
+            self.pending_remote[key] = now
+            self.last_target = key
+            proj = os.path.basename(a.cwd.rstrip("/")) or a.cwd or "?"
+            text = (f"🤖 {a.name} in {proj} ({a.host}) needs a decision:\n\n"
+                    f"{menu}\n\nTap a button, or reply with text to type it in.")
+            buttons = [{"text": o, "callback_data": f"{a.host}|{a.tty}|{o}"}
+                       for o in opts]
+            buttons.append({"text": "esc", "callback_data": f"{a.host}|{a.tty}|esc"})
+            if self.rc["telegram_chat_id"]:
+                self._tg("sendMessage",
+                         {"chat_id": self.rc["telegram_chat_id"], "text": text,
+                          "reply_markup": {"inline_keyboard": [buttons]}})
+            if self.rc["whatsapp_phone"] and self.rc["whatsapp_apikey"]:
+                wa_notify(self.rc["whatsapp_phone"], self.rc["whatsapp_apikey"],
+                          text + "\n(answer via Telegram)")
+            self.msgs.append(f"📱 prompt of {a.name}/{proj} sent to phone")
+
+    def poll_replies(self):
+        if not (self.rc["telegram_token"] and self.rc["telegram_chat_id"]):
+            time.sleep(15)
+            return
+        ups = tg_api(self.rc["telegram_token"], "getUpdates",
+                     {"offset": self.offset, "timeout": 20}, timeout=40)
+        me = str(self.rc["telegram_chat_id"])
+        for u in ups.get("result", []):
+            self.offset = u["update_id"] + 1
+            if "callback_query" in u:
+                cq = u["callback_query"]
+                if str(cq.get("from", {}).get("id")) != me:
+                    continue
+                host, tty, choice = cq["data"].split("|", 2)
+                result = self.answer(host, tty, choice)
+                self._tg("answerCallbackQuery", {"callback_query_id": cq["id"]})
+                self._say(result)
+            elif "message" in u:
+                m = u["message"]
+                if str(m.get("chat", {}).get("id")) != me:
+                    continue
+                txt = (m.get("text") or "").strip()
+                if not txt:
+                    continue
+                if self.last_target is None:
+                    self._say("no pending prompt to answer")
+                    continue
+                result = self.answer(*self.last_target, txt)
+                self._say(result)
+
+    def answer(self, host, tty, choice):
+        with self.lock:
+            agent = next((a for hs in self.state.values() for a in hs.agents
+                          if a.host == host and a.tty == tty), None)
+        if agent is None:
+            return f"that agent ({tty}) is gone"
+        if choice.lower() == "esc":
+            err = send_to_terminal(agent, "\x1b", submit=False)
+        else:
+            err = send_to_terminal(agent, choice, submit=True)
+        self.pending_remote.pop((host, tty), None)
+        self.notified.pop((host, tty), None)
+        proj = os.path.basename(agent.cwd.rstrip("/")) or "?"
+        self.msgs.append(f"📱 answered {agent.name}/{proj}: {choice!r}")
+        return err or f"✓ sent {choice!r} to {agent.name} in {proj}"
 
 
 # ---------------------------------------------------------------- closing
@@ -1318,15 +1520,20 @@ def draw(scr, state, lock, sel, sort_by, agent_cfg, ui_msg, policies):
     return sel, projects
 
 
-def auto_prod_pass(agents, agent_cfg, last_prod, msgs):
+def auto_prod_pass(agents, agent_cfg, last_prod, msgs,
+                   pending_remote=None, remote_timeout=300):
     now = time.time()
     for a in agents:
         if not effective_stalled(a, agent_cfg["idle_after"]):
             continue
+        if pending_remote and now - pending_remote.get((a.host, a.tty), 0) \
+                < remote_timeout:
+            continue        # a human was asked on the phone — hold off
         key = (a.host, a.pid)
         if now - last_prod.get(key, 0) < agent_cfg["prod_cooldown"]:
             continue
-        msg = prod_agent(a, agent_cfg["nudge"], agent_cfg["approve_prompts"])
+        msg = prod_agent(a, agent_cfg["nudge"], agent_cfg["approve_prompts"],
+                         agent_cfg["never_approve"])
         # an approved prompt usually precedes more work (or another prompt) —
         # recheck soon instead of waiting out the full cooldown
         last_prod[key] = (now - agent_cfg["prod_cooldown"] + 90
@@ -1346,6 +1553,12 @@ def tui(cfg):
     last_prod, msgs = {}, deque(maxlen=5)
     last_auto = 0.0
     policies = load_policies(cfg)
+    pending_remote = {}
+    remote_thread = None
+    if cfg["remote"]["enabled"] and cfg["remote"]["telegram_token"]:
+        remote_thread = RemoteAnswerer(cfg, state, lock, msgs,
+                                       pending_remote, policies)
+        remote_thread.start()
 
     def main(scr):
         nonlocal last_auto
@@ -1383,7 +1596,8 @@ def tui(cfg):
                 with lock:
                     agents = [a for hs in state.values() for a in hs.agents]
                     apply_policies(agents, policies)
-                auto_prod_pass(agents, cfg["agents"], last_prod, msgs)
+                auto_prod_pass(agents, cfg["agents"], last_prod, msgs,
+                               pending_remote, cfg["remote"]["remote_timeout"])
             ch = scr.getch()
             if pending is not None and ch != -1:
                 action, a = pending
@@ -1411,7 +1625,8 @@ def tui(cfg):
                 if a:
                     msgs.append(f"[{time.strftime('%H:%M')}] "
                                 + prod_agent(a, cfg["agents"]["nudge"],
-                                             cfg["agents"]["approve_prompts"]))
+                                             cfg["agents"]["approve_prompts"],
+                                             cfg["agents"]["never_approve"]))
                     last_prod[(a.host, a.pid)] = time.time()
             elif ch == ord("i") and rows:
                 p = rows[sel]
@@ -1449,6 +1664,8 @@ def tui(cfg):
     finally:
         for t in scanners:
             t.stop = True
+        if remote_thread:
+            remote_thread.stop = True
         wake.set()
 
 
@@ -1499,6 +1716,8 @@ def main():
     ap.add_argument("--config", default=str(Path(__file__).parent / "prodtop.toml"))
     ap.add_argument("--once", action="store_true",
                     help="print one snapshot as plain text and exit")
+    ap.add_argument("--test-remote", action="store_true",
+                    help="test the Telegram/WhatsApp connection and exit")
     args = ap.parse_args()
     if not os.path.exists(args.config):
         example = Path(__file__).parent / "prodtop.example.toml"
@@ -1507,10 +1726,50 @@ def main():
                   f"prodtop.toml and edit your hosts", file=sys.stderr)
             args.config = str(example)
     cfg = load_config(args.config)
-    if args.once:
+    if args.test_remote:
+        test_remote(cfg)
+    elif args.once:
         once(cfg)
     else:
         tui(cfg)
+
+
+def test_remote(cfg):
+    rc = cfg["remote"]
+    if not rc["telegram_token"]:
+        print("No telegram_token set. Setup:\n"
+              "  1. In Telegram, talk to @BotFather → /newbot → copy the token\n"
+              "  2. Put it in prodtop.toml under [remote] telegram_token\n"
+              "  3. Run --test-remote again to discover your chat id")
+        return
+    if not rc["telegram_chat_id"]:
+        print("No telegram_chat_id set. Send your bot any message now — "
+              "waiting up to 60s ...")
+        offset, deadline = 0, time.time() + 60
+        while time.time() < deadline:
+            ups = tg_api(rc["telegram_token"], "getUpdates",
+                         {"offset": offset, "timeout": 20}, timeout=40)
+            for u in ups.get("result", []):
+                offset = u["update_id"] + 1
+                m = u.get("message", {})
+                frm = m.get("from", {})
+                if m:
+                    print(f"  found chat id {m['chat']['id']} "
+                          f"({frm.get('first_name', '')} @{frm.get('username', '')})"
+                          f" — put it in [remote] telegram_chat_id")
+                    return
+        print("  nothing received — did you message the right bot?")
+        return
+    tg_api(rc["telegram_token"], "sendMessage",
+           {"chat_id": rc["telegram_chat_id"],
+            "text": "✅ prodtop remote answering is connected"})
+    print("Telegram: test message sent")
+    if rc["whatsapp_phone"] and rc["whatsapp_apikey"]:
+        wa_notify(rc["whatsapp_phone"], rc["whatsapp_apikey"],
+                  "prodtop: WhatsApp notifications connected")
+        print("WhatsApp: test message sent (via CallMeBot)")
+    else:
+        print("WhatsApp: not configured (optional; see prodtop.toml [remote])")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,14 @@ prod_cooldown = 900    # min seconds between prods of the same agent
 # reopened — for sessions managed by some other system.
 protected = []
 
+# Prompts containing any of these strings are NEVER auto-approved, even with
+# approve_prompts = true — they are pushed to your phone / left for a human.
+never_approve = [
+  "rm -rf", "sudo ", "--force", "force push", "git push",
+  "DROP TABLE", "shutdown", "reboot", "mkfs", "diskutil erase",
+  "crontab -r", "launchctl unload",
+]
+
 # Detect Chrome tabs with AI chats open and list them as proddable rows.
 # Web prods are manual-only ([p]) and need Chrome's
 # View > Developer > Allow JavaScript from Apple Events enabled.
@@ -39,6 +47,21 @@ web_prod = true
 "chatgpt.com" = "chatgpt-web"
 "chat.openai.com" = "chatgpt-web"
 "gemini.google.com" = "gemini-web"
+
+[remote]
+# Answer agent "1/2/3" decision menus from your phone. When an idle agent has
+# a numbered menu on screen, prodtop sends it to Telegram with answer buttons;
+# tapping one (or replying with text) types it into that terminal. Optional
+# WhatsApp pings are outbound-only (via the third-party callmebot.com — the
+# prompt text passes through it). Setup: @BotFather -> /newbot -> token here,
+# then ./prodtop.py --test-remote to discover your chat id.
+enabled = false
+telegram_token = ""    # NEVER commit real tokens — this file is a template
+telegram_chat_id = ""
+whatsapp_phone = ""
+whatsapp_apikey = ""
+menu_idle = 90         # agent quiet this long with a menu on screen -> notify
+remote_timeout = 300   # hold auto-approve while waiting for your answer
 
 [[hosts]]
 name = "local"

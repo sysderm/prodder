@@ -47,6 +47,14 @@ where every agent is sitting idle waiting for nothing.
 - **Per-project modes**: the MODE column shows `PROD` vs `leave`; toggle
   with `i`/`a`. Policies are keyed by project path and survive restarts,
   reopened sessions, and new agents in the same project.
+- **Answer from your phone**: when a quiet agent has a "1/2/3" decision menu
+  on screen, prodtop sends the menu to **Telegram** with answer buttons —
+  tap `1`, `2`, `esc`, or reply with free text, and it is typed into that
+  terminal. Optional **WhatsApp** pings (outbound-only, via callmebot.com).
+  While a question is on your phone, auto-approve holds off
+  (`remote_timeout`). Prompts matching `never_approve` patterns (`rm -rf`,
+  `--force`, `sudo`, ...) are *never* auto-approved — those always wait for
+  a human. Setup: `./prodtop.py --test-remote` walks you through it.
 
 ## Install & run
 
