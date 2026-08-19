@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""prodtop — btop-style activity monitor for file-producing projects.
+"""prodder — btop-style activity monitor for file-producing projects.
 
 Watches project folders on this Mac and on remote hosts (via ssh) and shows
 which projects are actively producing files: counts over several horizons,
@@ -21,10 +21,13 @@ Keys:  j/k or arrows  select    s  toggle sort (recency / 24h count)
 import argparse
 import curses
 import fnmatch
+import http.server
 import json
 import os
+import random
 import re
 import shlex
+import tempfile
 import shutil
 import signal
 import sqlite3
@@ -40,6 +43,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 SPARK_CHARS = " ▁▂▃▄▅▆▇█"
 SPARK_BUCKETS = 24          # 24 x 1h sparkline
 MAX_RECENT_FILES = 12
@@ -48,6 +53,10 @@ SSH_BASE = [
     "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
     "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/prodtop-%C",
     "-o", "ControlPersist=600",
+    # First contact with a tailnet name must not die on the known_hosts
+    # prompt (BatchMode can't answer it); accept-new never accepts a
+    # CHANGED key, only unknown hosts.
+    "-o", "StrictHostKeyChecking=accept-new",
 ]
 
 # Types text into a Terminal.app tab or iTerm2 session identified by its tty.
@@ -291,6 +300,7 @@ class AgentProc:
     cwd: str
     tty: str            # /dev/ttys012 or /dev/pts/3
     cpu: float
+    work_cpu: float = 0.0  # aggregate CPU of processes sharing this terminal
     tmux: str = ""      # session name, "" = not in tmux
     pane: str = ""      # tmux pane id (%N)
     sock: str = ""      # tmux socket path (remote multi-user servers)
@@ -300,8 +310,12 @@ class AgentProc:
     scanned_at: float = 0.0
     protected: bool = False
     detached: bool = False  # wrapper orphaned, no terminal window owns the tty
+    mac: bool = False       # remote host is a Mac: prod/capture non-tmux agents
+                            # via osascript over ssh (Terminal.app / iTerm2)
     policy: str = "auto"    # auto (proddable) | ignore (leave alone)
     label: str = ""         # display label (web tabs: the tab title)
+    recognized: bool = True # False = a plain terminal window with no known agent
+                            # (shown so nothing hides, but never auto-prodded)
 
     @property
     def web(self):
@@ -347,7 +361,8 @@ def load_config(path):
     s.setdefault("remote_interval", 60)
     s.setdefault("excludes", [".git", "node_modules", ".venv", "venv", "__pycache__"])
     a = cfg.setdefault("agents", {})
-    a.setdefault("process_names", ["claude", "codex", "chatgpt", "aider", "gemini", "goose"])
+    a.setdefault("process_names", ["claude", "codex", "chatgpt", "aider", "gemini", "goose",
+                                    "xcode", "antigravity", "cursor"])
     a.setdefault("idle_after", 600)
     a.setdefault("nudge", "continue")
     a.setdefault("approve_prompts", True)
@@ -370,12 +385,49 @@ def load_config(path):
     r.setdefault("imessage_handle", "")
     r.setdefault("menu_idle", 90)       # agent quiet this long + menu on screen -> notify
     r.setdefault("remote_timeout", 300)  # hold auto-approve this long awaiting a phone answer
+    # If you've touched the machine an agent runs on within this many seconds,
+    # skip the phone ping — you're right there and will see the prompt. Only
+    # applies to hosts whose keyboard idle we can read (this Mac + remote Macs).
+    r.setdefault("notify_active_window", 300)
     a.setdefault("auto_prod", False)
     a.setdefault("prod_cooldown", 900)
+    a.setdefault("auto_interval", 10)
+    a.setdefault("safe_stale_after", 20)
+    a.setdefault("safe_stale_cpu", 1.0)
+    a.setdefault("auto_restart_attempts", 3)
     a.setdefault("protected", [])
+    # Nudge experiment: prodder rotates through nudge_pool (epsilon-greedy
+    # bandit favouring whatever resumes real work) and logs each prod's
+    # outcome, so the effective phrasings surface in the dashboard. A
+    # per-project custom nudge always overrides the pool.
+    a.setdefault("nudge_pool", [
+        "continue!",
+        "continue",
+        "Please keep going with the current plan.",
+        "What's the next concrete step? Do it.",
+        "Proceed.",
+    ])
+    # Sent instead of a pool nudge when the screen looks finished or like it
+    # is asking the user a question — a blunt "continue!" there is what sends
+    # an agent off in the wrong direction. This one gives an explicit
+    # off-ramp so the agent re-checks rather than inventing work.
+    a.setdefault("reassess_nudge",
+                 "If the task is complete, briefly summarise what's done and "
+                 "what's left. If you're blocked or need a decision, say so. "
+                 "Otherwise continue.")
+    a.setdefault("bandit_epsilon", 0.15)   # explore rate for the nudge bandit
+    a.setdefault("outcome_window", 240)    # seconds to attribute a prod's outcome
+    # Surface EVERY open Terminal.app/iTerm2 window on the local Mac, not only
+    # the ones running a recognised agent — so a mistyped or unrecognised agent
+    # never hides in a window prodder didn't list. These extra rows are shown
+    # but never auto-prodded (they're plain shells until proven otherwise).
+    a.setdefault("show_all_terminals", True)
+    w = cfg.setdefault("web", {})
+    w.setdefault("port", 8737)
     cfg["hosts"] = [h for h in cfg.get("hosts", []) if h.get("enabled", True)]
     for h in cfg["hosts"]:
         h["roots"] = [os.path.expanduser(r) for r in h.get("roots", [])]
+        h.setdefault("os", "linux")   # remote hosts: "linux" | "mac"
     cfg["_dir"] = str(Path(path).resolve().parent)
     return cfg
 
@@ -384,25 +436,27 @@ def load_config(path):
 # Policies are keyed "host|/path/to/project" and apply to any agent whose cwd
 # is inside that path — they survive restarts, reopens and pid changes.
 
-def load_policies(cfg):
+def load_state(cfg):
+    """(policies, nudges) from prodtop-state.json."""
     try:
         with open(Path(cfg["_dir"]) / "prodtop-state.json") as f:
-            return json.load(f).get("policies", {})
+            d = json.load(f)
+            return d.get("policies", {}), d.get("nudges", {})
     except (OSError, ValueError):
-        return {}
+        return {}, {}
 
 
-def save_policies(cfg, policies):
+def save_state(cfg, policies, nudges):
     try:
         with open(Path(cfg["_dir"]) / "prodtop-state.json", "w") as f:
-            json.dump({"policies": policies}, f, indent=1)
+            json.dump({"policies": policies, "nudges": nudges}, f, indent=1)
     except OSError:
         pass
 
 
-def match_policy(host, path, policies):
-    """Most-specific policy whose 'host|prefix' contains path."""
-    best_len, best = -1, "auto"
+def match_policy(host, path, policies, default="auto"):
+    """Most-specific value whose 'host|prefix' key contains path."""
+    best_len, best = -1, default
     for k, v in policies.items():
         khost, _, kpath = k.partition("|")
         kpath = kpath.rstrip("/")
@@ -426,7 +480,7 @@ def row_path(p):
 
 
 def effective_stalled(a, idle_after):
-    return (not a.protected and a.policy != "ignore"
+    return (a.recognized and not a.protected and a.policy != "ignore"
             and agent_state(a, idle_after) == "stalled")
 
 
@@ -435,7 +489,9 @@ def primary_agent(p):
 
 
 def agent_regex(names):
-    return re.compile(r"(?:^|[/\s])(" + "|".join(re.escape(n) for n in names) + r")(?:\s|$)")
+    # ".exe" tail: claude-code's real binary is claude.exe even on Unix.
+    return re.compile(r"(?:^|[/\s])(" + "|".join(re.escape(n) for n in names)
+                      + r")(?:\.exe)?(?:\s|$)")
 
 
 def is_protected(session_name, patterns):
@@ -653,7 +709,7 @@ def scan_agents_local(host_name, agent_cfg):
                              capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError):
         return []
-    rows, procs = [], {}
+    rows, procs, tty_cpu = [], {}, {}
     for line in out.stdout.splitlines():
         parts = line.split(None, 4)
         if len(parts) < 5:
@@ -663,6 +719,11 @@ def scan_agents_local(host_name, agent_cfg):
             procs[int(pid)] = (int(ppid), tty, args.split()[0] if args else "")
         except ValueError:
             continue
+        if tty not in ("??", "?", "-"):
+            try:
+                tty_cpu["/dev/" + tty] = tty_cpu.get("/dev/" + tty, 0.0) + float(cpu)
+            except ValueError:
+                pass
         if tty in ("??", "?", "-") or "prodtop" in args:
             continue
         m = rx.search(args)
@@ -672,30 +733,14 @@ def scan_agents_local(host_name, agent_cfg):
             rows.append((int(pid), "/dev/" + tty, float(cpu), m.group(1)))
         except ValueError:
             pass
-    cwds = {}
-    if rows:
-        try:
-            lo = subprocess.run(
-                ["lsof", "-a", "-d", "cwd", "-p",
-                 ",".join(str(p) for p, _, _, _ in rows), "-Fn"],
-                capture_output=True, text=True, timeout=15)
-            cur = None
-            for ln in lo.stdout.splitlines():
-                if ln.startswith("p"):
-                    try:
-                        cur = int(ln[1:])
-                    except ValueError:
-                        cur = None
-                elif ln.startswith("n") and cur is not None:
-                    cwds[cur] = ln[1:]
-        except (OSError, subprocess.SubprocessError):
-            pass
+    cwds = lsof_cwds([p for p, _, _, _ in rows])
     panes = list_local_tmux_panes()
     window_ttys = list_window_ttys()
     agents = []
     for pid, tty, cpu, name in rows:
         a = AgentProc(host=host_name, ssh="", pid=pid, name=name,
-                      cwd=cwds.get(pid, ""), tty=tty, cpu=cpu, scanned_at=now)
+                      cwd=cwds.get(pid, ""), tty=tty, cpu=cpu,
+                      work_cpu=tty_cpu.get(tty, cpu), scanned_at=now)
         ot, attached = outer_tty(pid, procs)
         a.prod_tty = "/dev/" + ot if ot else tty
         if window_ttys is not None:
@@ -714,7 +759,79 @@ def scan_agents_local(host_name, agent_cfg):
                 a.idle = -1.0
         a.protected = is_protected(a.tmux, agent_cfg["protected"])
         agents.append(a)
-    return dedupe_by_tty(agents)
+    agents = dedupe_by_tty(agents)
+    if agent_cfg.get("show_all_terminals", True) and window_ttys:
+        agents += plain_terminals(host_name, window_ttys, agents, procs,
+                                  tty_cpu, panes, now)
+    return agents
+
+
+def plain_terminals(host_name, window_ttys, agents, procs, tty_cpu, panes, now):
+    """Placeholder rows for open Terminal/iTerm windows that hold no recognised
+    agent — so an unrecognised or mistyped agent can't hide in a window prodder
+    never listed. Shown, but never auto-prodded (see AgentProc.recognized)."""
+    covered = set()
+    for a in agents:
+        covered.add(a.tty)
+        if a.prod_tty:
+            covered.add(a.prod_tty)
+    want = [w for w in window_ttys if w not in covered]
+    if not want:
+        return []
+    # foreground process per uncovered window tty: the highest-pid process still
+    # on that tty (a shell's most recent child), used only for its name + cwd.
+    leaf = {}
+    for pid, (ppid, t, comm) in procs.items():
+        if t in ("??", "?", "-"):
+            continue
+        full = "/dev/" + t
+        if full not in want or "prodtop" in comm:
+            continue
+        if full not in leaf or pid > leaf[full][0]:
+            leaf[full] = (pid, comm)
+    extra = lsof_cwds([v[0] for v in leaf.values()])
+    out = []
+    for wtty in want:
+        pid, comm = leaf.get(wtty, (0, ""))
+        name = os.path.basename(comm).lstrip("-") or "shell"
+        pane = panes.get(wtty)
+        a = AgentProc(host=host_name, ssh="", pid=pid, name=name,
+                      cwd=extra.get(pid, ""), tty=wtty, cpu=0.0,
+                      work_cpu=tty_cpu.get(wtty, 0.0), scanned_at=now,
+                      recognized=False)
+        a.prod_tty = wtty
+        if pane:
+            a.tmux, a.pane, a.sock = pane["session"], pane["pane"], pane["sock"]
+        try:
+            a.idle = max(0.0, now - os.stat(wtty).st_mtime)
+        except OSError:
+            a.idle = -1.0
+        out.append(a)
+    return out
+
+
+def lsof_cwds(pids):
+    """pid -> current working directory via one lsof call ({} on any failure)."""
+    cwds = {}
+    pids = [p for p in pids if p]
+    if not pids:
+        return cwds
+    try:
+        lo = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-p", ",".join(str(p) for p in pids), "-Fn"],
+            capture_output=True, text=True, timeout=15)
+        cur = None
+        for ln in lo.stdout.splitlines():
+            if ln.startswith("p"):
+                try:
+                    cur = int(ln[1:])
+                except ValueError:
+                    cur = None
+            elif ln.startswith("n") and cur is not None:
+                cwds[cur] = ln[1:]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return cwds
 
 
 def remote_command(roots, excludes, days):
@@ -736,16 +853,48 @@ def remote_command(roots, excludes, days):
     )
 
 
-def scan_remote(host_name, ssh_target, roots, excludes, window, agent_cfg):
-    """One ssh round-trip: recent files + agent processes + tmux + tty idle."""
+def remote_command_mac(roots, excludes, days):
+    """BSD variant for remote Macs (no GNU find/stat, no /proc; tmux sockets
+    live under the per-user DARWIN_USER_TEMP_DIR; agents usually sit in
+    Terminal.app/iTerm2 windows). Emits the same sections as remote_command
+    plus PROCS (pid/ppid/tty/comm) so the caller can walk the process chain
+    to the outermost tty (asciinema wrappers, see outer_tty)."""
+    prune = " -o ".join(f"-name {shlex.quote(x)}" for x in excludes)
+    roots_q = " ".join(shlex.quote(r) for r in roots)
+    return (
+        f"find {roots_q} \\( {prune} \\) -prune -o "
+        f"-type f -mtime -{days} -print0 2>/dev/null | "
+        "xargs -0 stat -f '%m%t%N' 2>/dev/null; "
+        "echo ===AGENTS===; ps -eo pid=,tty=,pcpu=,args=; "
+        "echo ===PROCS===; ps -eo pid=,ppid=,tty=,comm=; "
+        'echo ===TMUX===; for s in /tmp/tmux-*/default '
+        '"$(getconf DARWIN_USER_TEMP_DIR)"tmux-*/default; do '
+        'tmux -S "$s" list-panes -a -F '
+        '"$s|#{pane_tty}|#{pane_id}|#{session_name}|#{window_activity}" 2>/dev/null; '
+        "done; "
+        "echo ===CWD===; pids=$(ps -eo pid=,tty= | "
+        "awk '$2 ~ /^ttys/ {printf \"%s,\",$1}'); "
+        '[ -n "$pids" ] && lsof -a -p "${pids%,}" -d cwd -Fn 2>/dev/null | '
+        "awk '/^p/{pid=substr($0,2)} /^n/{print pid, substr($0,2)}'; "
+        "echo ===TTY===; stat -f '%N %m' /dev/ttys* 2>/dev/null; true"
+    )
+
+
+def scan_remote(host_name, ssh_target, roots, excludes, window, agent_cfg,
+                mac=False):
+    """One ssh round-trip: recent files + agent processes + tmux + tty idle.
+    The script goes over stdin to /bin/sh so the remote login shell (zsh on
+    Macs, aborts on unmatched globs) never parses it."""
     days = max(1, int(window // 86400))
-    out = subprocess.run(SSH_BASE + [ssh_target, remote_command(roots, excludes, days)],
+    script = (remote_command_mac if mac else remote_command)(roots, excludes, days)
+    out = subprocess.run(SSH_BASE + [ssh_target, "/bin/sh -s"], input=script,
                          capture_output=True, text=True, timeout=120)
     if out.returncode != 0:
         raise RuntimeError(out.stderr.strip().splitlines()[-1] if out.stderr.strip()
                            else f"ssh exit {out.returncode}")
     now = time.time()
-    sections = {"FIND": [], "AGENTS": [], "TMUX": [], "CWD": [], "TTY": []}
+    sections = {"FIND": [], "AGENTS": [], "PROCS": [], "TMUX": [], "CWD": [],
+                "TTY": []}
     cur = "FIND"
     for line in out.stdout.splitlines():
         if line.startswith("===") and line.endswith("===") and line[3:-3] in sections:
@@ -784,14 +933,34 @@ def scan_remote(host_name, ssh_target, roots, excludes, window, agent_cfg):
         except ValueError:
             pass
 
+    procs = {}
+    for line in sections["PROCS"]:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            procs[int(parts[0])] = (int(parts[1]), parts[2], parts[3])
+        except ValueError:
+            continue
+
     rx = agent_regex(agent_cfg["process_names"])
     agents = []
+    tty_cpu = {}
+    for line in sections["AGENTS"]:
+        parts = line.split(None, 3)
+        if len(parts) < 4 or parts[1] in ("??", "?", "-"):
+            continue
+        try:
+            dev = "/dev/" + parts[1]
+            tty_cpu[dev] = tty_cpu.get(dev, 0.0) + float(parts[2])
+        except ValueError:
+            pass
     for line in sections["AGENTS"]:
         parts = line.split(None, 3)
         if len(parts) < 4:
             continue
         pid, tty, cpu, args = parts
-        if tty in ("?", "-"):
+        if tty in ("??", "?", "-") or "prodtop" in args:
             continue
         m = rx.search(args)
         if not m:
@@ -800,7 +969,8 @@ def scan_remote(host_name, ssh_target, roots, excludes, window, agent_cfg):
         try:
             a = AgentProc(host=host_name, ssh=ssh_target, pid=int(pid),
                           name=m.group(1), cwd=cwds.get(pid, ""), tty=dev,
-                          cpu=float(cpu), scanned_at=now)
+                          cpu=float(cpu), work_cpu=tty_cpu.get(dev, float(cpu)),
+                          scanned_at=now, mac=mac)
         except ValueError:
             continue
         pane = panes.get(dev)
@@ -809,6 +979,12 @@ def scan_remote(host_name, ssh_target, roots, excludes, window, agent_cfg):
             a.idle = max(0.0, now - pane["activity"]) if pane["activity"] else -1.0
         elif dev in tty_mtimes:
             a.idle = max(0.0, now - tty_mtimes[dev])
+        if mac and not a.pane:
+            ot, attached = outer_tty(a.pid, procs)
+            a.prod_tty = "/dev/" + ot if ot else dev
+            a.detached = not attached
+            if a.prod_tty != dev and a.prod_tty in tty_mtimes:
+                a.idle = max(0.0, now - tty_mtimes[a.prod_tty])
         a.protected = is_protected(a.tmux, agent_cfg["protected"])
         agents.append(a)
     return entries, dedupe_by_tty(agents)
@@ -844,7 +1020,8 @@ class Scanner(threading.Thread):
                     entries = scan_local(roots, excludes, window)
                 else:
                     entries, agents = scan_remote(name, self.cfg["ssh"], roots,
-                                                  excludes, window, self.agent_cfg)
+                                                  excludes, window, self.agent_cfg,
+                                                  mac=self.cfg["os"] == "mac")
                 projects = build_projects(name, roots, entries, window)
                 with self.lock:
                     hs = self.state[name]
@@ -869,15 +1046,57 @@ class Scanner(threading.Thread):
 PROMPT_RX = re.compile(
     r"Yes, proceed|1\. Yes|Do you want to proceed|Would you like to run")
 
+# A screen that looks FINISHED or is handing the decision back to the user.
+# Prodding these with a directive "continue!" is the main way an agent gets
+# sent off in the wrong direction (it invents work to satisfy the nudge), so
+# when the tail of the screen matches, prodder sends the reassess_nudge — an
+# explicit off-ramp — instead. Erring toward over-detection is cheap here: the
+# reassess nudge still ends with "otherwise continue", so a false positive
+# only sends a gentler prod; a false negative sends the harmful blunt one.
+#
+# STRONG phrases are distinctive hand-backs / questions — safe to match
+# anywhere in the tail. WEAK phrases are generic completion words that could
+# appear inside a log line, so they only count at the start of a (bulleted)
+# line or as a standalone sentence.
+STRONG_DONE_RX = re.compile(
+    r"(?i)("
+    r"is there anything else|anything else\?|let me know if|"
+    r"would you like me to|do you want me to|shall i\b|"
+    r"what would you like|how would you like|which (?:option|approach)|"
+    r"here'?s (?:a |the )?summary|to summari[sz]e\b|in summary\b|"
+    r"waiting for (?:your )?(?:input|response|confirmation|decision)|"
+    r"i'?ll (?:wait|stop here)|standing by\b"
+    r")")
+WEAK_DONE_RX = re.compile(
+    r"(?im)^[\s>*•\-]*(?:the )?("
+    r"task (?:is )?complete|all done\b|i'?m done\b|"
+    r"done!|✓|✅|completed[.!]|finished[.!]"
+    r")")
+
+
+def looks_done(screen):
+    """True if the visible tail suggests the agent finished or is asking the
+    user something — i.e. a plain 'continue!' would misfire."""
+    tail = "\n".join(screen.splitlines()[-12:])
+    return bool(STRONG_DONE_RX.search(tail) or WEAK_DONE_RX.search(tail))
+
 
 def send_to_terminal(agent, text, submit=True):
     """Deliver text (and optionally a submitting Enter) to the agent's
     terminal. text of "\\x1b" sends a bare Escape. Returns None on success,
     an error string otherwise."""
+    # Central guard: protected fleet sessions (cockpit-*, vps-batch, agentd,
+    # …; see ~/CLAUDE.md) are hands-off for EVERY caller — prod, manual type,
+    # recovery. prod_agent also checks earlier, but keystrokes must never
+    # reach a protected pane by any path.
+    if agent.protected:
+        return f"'{agent.tmux}' is a protected session — not typing into it"
     try:
         if agent.pane:
             if text == "\x1b":
                 parts = [["send-keys", "-t", agent.pane, "Escape"]]
+            elif text == "\x03":
+                parts = [["send-keys", "-t", agent.pane, "C-c"]]
             else:
                 parts = []
                 if text:
@@ -901,11 +1120,19 @@ def send_to_terminal(agent, text, submit=True):
             if r is not None and r.returncode != 0:
                 return f"send failed: {r.stderr.strip()[:80]}"
             return None
-        if not agent.ssh:
+        if not agent.ssh or agent.mac:
             tty = agent.prod_tty or agent.tty
-            r = subprocess.run(
-                ["osascript", "-", tty, text, "1" if submit and text != "\x1b" else "0"],
-                input=OSA_SEND, capture_output=True, text=True, timeout=30)
+            osa_args = [tty, text, "1" if submit and text != "\x1b" else "0"]
+            if agent.ssh:
+                # Remote Mac: same AppleScript, executed on that Mac. Needs a
+                # one-time Automation consent for sshd on the remote machine.
+                cmd = "osascript - " + " ".join(shlex.quote(x) for x in osa_args)
+                r = subprocess.run(SSH_BASE + [agent.ssh, cmd], input=OSA_SEND,
+                                   capture_output=True, text=True, timeout=45)
+            else:
+                r = subprocess.run(["osascript", "-"] + osa_args,
+                                   input=OSA_SEND, capture_output=True, text=True,
+                                   timeout=30)
             res = r.stdout.strip()
             if res == "ok":
                 return None
@@ -918,17 +1145,20 @@ def send_to_terminal(agent, text, submit=True):
         return f"send failed: {e}"
 
 
-def prod_agent(agent, nudge, approve_prompts=True, never_approve=()):
+def prod_agent(agent, nudge, approve_prompts=True, never_approve=(), screen=None):
     """Unstick an agent: if it is sitting on an approval prompt, press Enter
     to accept the default "Yes"; otherwise type the nudge text + Enter.
-    Prompts matching a never_approve pattern are left for a human."""
+    Prompts matching a never_approve pattern are left for a human. Pass
+    `screen` to reuse an already-captured view instead of grabbing it again."""
     if agent.protected:
         return f"'{agent.tmux}' is a protected session — not prodding"
     if agent.web:
         return prod_web(agent, nudge)
     text, verb = nudge, "prodded"
     if approve_prompts:
-        tail = "\n".join(capture_screen(agent).splitlines()[-30:])
+        if screen is None:
+            screen = capture_screen(agent)
+        tail = "\n".join(screen.splitlines()[-30:])
         if PROMPT_RX.search(tail):
             low = tail.lower()
             if any(p.lower() in low for p in never_approve):
@@ -1058,6 +1288,31 @@ def imsg_poll(handle, last_rowid):
     return [(rid, imsg_extract_text(txt, blob)) for rid, txt, blob in rows]
 
 
+HID_IDLE_RX = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
+
+
+def _hid_idle_from_ioreg(text):
+    vals = [int(x) for x in HID_IDLE_RX.findall(text)]
+    return min(vals) / 1e9 if vals else None   # ns -> s; min = most recent input
+
+
+def human_idle_secs(host_cfg):
+    """Seconds since the user last touched this machine's keyboard/mouse, or
+    None when it can't be known (headless Linux box, unreachable host)."""
+    try:
+        if host_cfg.get("local"):
+            r = subprocess.run(["ioreg", "-c", "IOHIDSystem"],
+                               capture_output=True, text=True, timeout=5)
+            return _hid_idle_from_ioreg(r.stdout)
+        if host_cfg.get("os") == "mac" and host_cfg.get("ssh"):
+            r = subprocess.run(SSH_BASE + [host_cfg["ssh"], "ioreg -c IOHIDSystem"],
+                               capture_output=True, text=True, timeout=10)
+            return _hid_idle_from_ioreg(r.stdout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+
 class RemoteAnswerer(threading.Thread):
     """Watches quiet agents for on-screen choice menus, pushes them to
     Telegram (buttons) and optionally WhatsApp (notify-only), and types
@@ -1067,14 +1322,29 @@ class RemoteAnswerer(threading.Thread):
     def __init__(self, cfg, state, lock, msgs, pending_remote, policies):
         super().__init__(daemon=True)
         self.rc, self.agent_cfg = cfg["remote"], cfg["agents"]
+        self.hosts = {h["name"]: h for h in cfg["hosts"]}
         self.state, self.lock, self.msgs = state, lock, msgs
         self.pending_remote, self.policies = pending_remote, policies
         self.offset = 0
         self.notified, self.last_check = {}, {}
+        self.idle_cache = {}                # host -> (checked_at, idle_secs|None)
         self.last_target = None
         self.imsg_rowid = None
         self.own_texts = deque(maxlen=30)   # texts we sent to the self-chat
         self.stop = False
+
+    def _user_at_machine(self, host, window):
+        """True if the user touched `host` within `window` seconds. Cached so
+        we don't ioreg/ssh on every loop; unknown hosts return False (notify)."""
+        hc = self.hosts.get(host)
+        if not hc:
+            return False
+        now = time.time()
+        ts, idle = self.idle_cache.get(host, (0.0, None))
+        if now - ts > 15:
+            idle = human_idle_secs(hc)
+            self.idle_cache[host] = (now, idle)
+        return idle is not None and idle < window
 
     def run(self):
         while not self.stop:
@@ -1106,16 +1376,27 @@ class RemoteAnswerer(threading.Thread):
         now = time.time()
         for a in agents:
             key = (a.host, a.tty)
-            if a.web or a.protected or a.policy == "ignore":
-                continue
-            if a.eff_idle() < self.rc["menu_idle"]:
-                self.notified.pop(key, None)
+            if a.web or a.protected or a.policy == "ignore" or not a.recognized:
                 continue
             if now - self.last_check.get(key, 0) < 60:
                 continue
             self.last_check[key] = now
             menu, opts = extract_menu(capture_screen(a))
             if not menu:
+                continue
+            # Codex redraws its approval UI while it is waiting for input, so
+            # the terminal's mtime can stay fresh forever.  Such prompts are
+            # still explicit human decisions and must reach the phone; normal
+            # numbered menus continue to respect menu_idle.
+            if (a.eff_idle() < self.rc["menu_idle"]
+                    and not PROMPT_RX.search(menu)):
+                self.notified.pop(key, None)
+                continue
+            # If you're sitting at the machine this agent runs on, you'll see
+            # the prompt yourself — don't buzz your phone. Reset notified so a
+            # later matured menu still reaches you once you walk away.
+            if self._user_at_machine(a.host, self.rc.get("notify_active_window", 300)):
+                self.notified.pop(key, None)
                 continue
             h = hash(menu)
             if self.notified.get(key) == h:
@@ -1155,7 +1436,22 @@ class RemoteAnswerer(threading.Thread):
                     continue
                 host, tty, choice = cq["data"].split("|", 2)
                 result = self.answer(host, tty, choice)
-                self._tg("answerCallbackQuery", {"callback_query_id": cq["id"]})
+                delivered = result.startswith("✓ sent ")
+                self._tg("answerCallbackQuery", {
+                    "callback_query_id": cq["id"],
+                    "text": "✓ Sent — prompt closed" if delivered else result[:180],
+                })
+                if delivered and cq.get("message"):
+                    msg = cq["message"]
+                    # Retire the inline keyboard so a question cannot be
+                    # answered twice after its choice reached the terminal.
+                    closed = (msg.get("text") or "") + (
+                        "\n\n✅ Answer sent — this prompt is closed.")
+                    self._tg("editMessageText", {
+                        "chat_id": msg["chat"]["id"],
+                        "message_id": msg["message_id"],
+                        "text": closed[:4096],
+                    })
                 self._say(result)
             elif "message" in u:
                 m = u["message"]
@@ -1312,6 +1608,11 @@ def capture_screen(agent):
                 r = subprocess.run(["tmux", "capture-pane", "-p", "-t", agent.pane],
                                    capture_output=True, text=True, timeout=10)
             return r.stdout
+        if agent.ssh and agent.mac:
+            cmd = "osascript - " + shlex.quote(agent.prod_tty or agent.tty)
+            r = subprocess.run(SSH_BASE + [agent.ssh, cmd], input=OSA_CAPTURE,
+                               capture_output=True, text=True, timeout=40)
+            return r.stdout
         if not agent.ssh:
             r = subprocess.run(["osascript", "-", agent.prod_tty or agent.tty],
                                input=OSA_CAPTURE, capture_output=True, text=True,
@@ -1320,6 +1621,61 @@ def capture_screen(agent):
     except (OSError, subprocess.SubprocessError):
         pass
     return ""
+
+
+ANSI_RX = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+BUSY_SCREEN_RX = re.compile(
+    r"\b(thinking|working|running|loading|processing|compiling|building|"
+    r"installing|downloading|fetching)\b", re.I)
+
+
+def screen_fingerprint(screen):
+    """Stable current terminal view, ignoring escape codes and padding."""
+    plain = ANSI_RX.sub("", screen)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in plain.splitlines()]
+    # Terminal.app returns full scrollback.  Only its current tail represents
+    # what the agent is doing now; stale historical prompts must not veto a
+    # safe nudge forever.
+    return "\n".join(line for line in lines if line)[-30:][-4000:]
+
+
+class SafeStaleTracker:
+    """Require a quiet, unchanged terminal before an automatic nudge.
+
+    A low-CPU agent alone is not enough: it may be waiting on a tool.  We
+    additionally require that the visible terminal has not meaningfully
+    changed for a configured interval and never nudge a displayed decision.
+    """
+    def __init__(self):
+        self.samples = {}
+
+    def ready(self, agent, cfg, now):
+        key = (agent.host, agent.tty)
+        if (agent.web or agent.protected or agent.policy == "ignore"
+                or not agent.recognized):
+            self.samples.pop(key, None)
+            return False
+        if agent.work_cpu > cfg["safe_stale_cpu"]:
+            self.samples.pop(key, None)
+            return False
+        screen = capture_screen(agent)
+        fingerprint = screen_fingerprint(screen)
+        # An unreadable/empty screen is never evidence that it is safe to
+        # interrupt.  Menus are handed to RemoteAnswerer instead.
+        if (not fingerprint or PROMPT_RX.search(fingerprint)
+                or extract_menu(fingerprint)[0]
+                or BUSY_SCREEN_RX.search(fingerprint)):
+            self.samples.pop(key, None)
+            return False
+        old = self.samples.get(key)
+        if old is None or old["fingerprint"] != fingerprint:
+            self.samples[key] = {"fingerprint": fingerprint, "since": now}
+            return False
+        return now - old["since"] >= cfg["safe_stale_after"]
+
+    def fingerprint(self, agent):
+        sample = self.samples.get((agent.host, agent.tty))
+        return sample["fingerprint"] if sample else ""
 
 
 def close_agent(agent, cfg):
@@ -1433,6 +1789,42 @@ def reopen_agent(agent, cfg):
                   else "; could NOT open a new terminal — resume cmd is in the log")
 
 
+RESUME_ON_SCREEN_RX = re.compile(
+    r"(?:cd\s+[^\n;&]+\s*&&\s*)?"
+    r"(?:codex\s+resume(?:\s+(?:--last|[\w-]+))?|"
+    r"claude\s+--resume\s+[^\s`]+)", re.I)
+
+
+def resume_from_screen(screen):
+    """A CLI's Ctrl-C output may include the exact resume command to reuse."""
+    matches = RESUME_ON_SCREEN_RX.findall(screen)
+    return matches[-1].strip() if matches else ""
+
+
+def recover_agent(agent, cfg):
+    """Interrupt a local attached agent, then restart it from its resume hint."""
+    if agent.ssh or agent.web or agent.detached:
+        return "recovery skipped — agent is not an attached local terminal"
+    err = send_to_terminal(agent, "\x03", submit=False)
+    if err:
+        return f"recovery Ctrl-C failed: {err}"
+    time.sleep(2)
+    cmd = resume_from_screen(capture_screen(agent))
+    if not cmd:
+        resume = find_resume(agent)
+        cmd = resume[0] if resume else ""
+    if not cmd:
+        return "recovery stopped agent but found no resume command"
+    try:
+        r = subprocess.run(["osascript", "-", cmd], input=OSA_OPEN,
+                           capture_output=True, text=True, timeout=30)
+        if r.stdout.strip() == "ok":
+            return f"recovered {agent.name} with `{cmd}`"
+        return f"recovery restart failed: {(r.stderr or r.stdout).strip()[:80]}"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"recovery restart failed: {e}"
+
+
 # ---------------------------------------------------------------- display
 
 def fmt_age(secs):
@@ -1460,6 +1852,8 @@ def sparkline(buckets):
 
 
 def agent_state(agent, idle_after):
+    if not agent.recognized:
+        return "term"
     if agent.protected:
         return "prot"
     idle = agent.eff_idle()
@@ -1468,17 +1862,27 @@ def agent_state(agent, idle_after):
     return "run" if idle < idle_after else "stalled"
 
 
-def agent_cell(p, idle_after):
+def agent_cell(p, idle_after, last_prod=None, prod_cooldown=0):
     if not p.agents:
         return ""
     a = primary_agent(p)
     st = agent_state(a, idle_after)
-    tag = {"prot": "🔒", "run": "●", "stalled": "⚠", "unknown": "·"}[st]
+    tag = {"prot": "🔒", "run": "●", "stalled": "⚠", "unknown": "·",
+           "term": "▹"}[st]
     if a.detached:
         tag = "⊗"
     if a.policy == "ignore":
         tag = "⊘"
     s = f"{tag}{a.name} {fmt_age(a.eff_idle())}"
+    # Make automatic prodding observable: a stale agent displays the live
+    # cooldown until its next eligible `continue!`, rather than silently
+    # appearing ignored.
+    sent_at = (last_prod or {}).get((a.host, a.pid), 0)
+    remaining = max(0, prod_cooldown - (time.time() - sent_at)) if sent_at else 0
+    if sent_at and remaining:
+        s += f" next {fmt_age(remaining)}"
+    elif sent_at:
+        s += " next now"
     if len(p.agents) > 1:
         s += f" +{len(p.agents) - 1}"
     return s
@@ -1511,10 +1915,18 @@ def gather_rows(state, lock, sort_by, idle_after, policies):
                                               buckets=[0] * SPARK_BUCKETS)
                     else:
                         name = os.path.basename(a.cwd.rstrip("/")) or a.cwd
+                        blank = "(open terminal)" if not a.recognized else "(no recent files)"
                         pseudo[key] = Project(name=name, host=a.host,
                                               root=os.path.dirname(a.cwd.rstrip("/")),
-                                              latest_file="(no recent files)",
+                                              latest_file=blank,
                                               buckets=[0] * SPARK_BUCKETS)
+                owner = pseudo[key]
+            elif owner is None and not a.recognized:
+                key = (a.host, "__terminals__")
+                if key not in pseudo:
+                    pseudo[key] = Project(name="terminals", host=a.host, root="",
+                                          latest_file="(open terminal windows)",
+                                          buckets=[0] * SPARK_BUCKETS)
                 owner = pseudo[key]
             if owner is not None:
                 owner.agents.append(a)
@@ -1531,7 +1943,43 @@ def gather_rows(state, lock, sort_by, idle_after, policies):
     return projects, hosts, agents
 
 
-def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies):
+def read_line(scr, prompt, initial=""):
+    """Inline single-line input on the bottom row. Enter=confirm, ESC=cancel
+    (returns None). Blocks the UI loop while typing."""
+    h, w = scr.getmaxyx()
+    buf = list(initial)
+    curses.curs_set(1)
+    scr.timeout(-1)
+    try:
+        while True:
+            line = " " + prompt + "".join(buf)
+            try:
+                scr.addnstr(h - 1, 0, " " * (w - 1), w - 1)
+                scr.addnstr(h - 1, 0, line[-(w - 2):], w - 2,
+                            curses.A_BOLD)
+            except curses.error:
+                pass
+            scr.refresh()
+            try:
+                ch = scr.get_wch()
+            except curses.error:
+                continue
+            if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                return "".join(buf)
+            if ch == "\x1b":
+                return None
+            if ch in ("\x7f", "\x08") or ch == curses.KEY_BACKSPACE:
+                if buf:
+                    buf.pop()
+            elif isinstance(ch, str) and ch.isprintable():
+                buf.append(ch)
+    finally:
+        scr.timeout(500)
+        curses.curs_set(0)
+
+
+def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies,
+         nudges, last_prod):
     now = time.time()
     idle_after = agent_cfg["idle_after"]
     scr.erase()
@@ -1569,13 +2017,13 @@ def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies):
     clock = time.strftime("%H:%M:%S")
     put(0, max(x + 2 + len(ag_lbl) + 2, w - len(clock) - 1), clock, curses.color_pair(3))
     auto = "on" if agent_cfg["auto_prod"] else "off"
-    put(1, 0, f" sort: {sort_by}  auto-prod: {auto}   [p] prod now  "
-              f"[a] MODE→PROD  [i] MODE→leave  [x] close+save  "
-              f"[o] reopen detached  [s] sort  [r] rescan  [q] quit",
+    put(1, 0, f" sort: {sort_by}  auto-prod: {auto}   [p] prod  [t] type msg  "
+              f"[n] set nudge  [a] →PROD  [i] →leave  [x] close  [o] reopen  "
+              f"[s] sort  [r] rescan  [q] quit",
         curses.color_pair(3))
 
     # column layout
-    name_w, host_w, mode_w, agent_w, cnt_w = 22, 5, 6, 16, 6
+    name_w, host_w, mode_w, agent_w, cnt_w = 22, 5, 6, 22, 6
     hdr = (f" {'PROJECT':<{name_w}} {'HOST':<{host_w}} {'MODE':<{mode_w}} "
            f"{'AGENT':<{agent_w}}"
            + "".join(f"{lbl:>{cnt_w}}" for lbl, _ in HORIZONS)
@@ -1603,7 +2051,8 @@ def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies):
             mode = ("PROD" if match_policy(p.host, row_path(p), policies) == "auto"
                     else "leave")
         line = (f" {p.name:<{name_w}.{name_w}} {p.host:<{host_w}} {mode:<{mode_w}}"
-                f" {agent_cell(p, idle_after):<{agent_w}.{agent_w}}"
+                f" {agent_cell(p, idle_after, last_prod,
+                               agent_cfg['prod_cooldown']):<{agent_w}.{agent_w}}"
                 + "".join(f"{p.counts.get(lbl, 0):>{cnt_w}}" for lbl, _ in HORIZONS)
                 + f"  {sparkline(p.buckets)}  "
                 + f"{trunc_path(p.latest_file, 40)}"
@@ -1617,8 +2066,11 @@ def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies):
     put(h - detail_h, 0, "─" * (w - 1), curses.color_pair(3))
     if projects:
         p = projects[sel]
+        custom = match_policy(p.host, row_path(p), nudges, None)
         put(h - detail_h + 1, 1,
-            f"{p.host}:{p.root}/{p.name} — newest files:", curses.A_BOLD)
+            f"{p.host}:{p.root}/{p.name}"
+            + (f"  [nudge: {custom[:40]}]" if custom else "")
+            + " — newest files:", curses.A_BOLD)
         for i, (mt, rel) in enumerate(p.recent[:detail_h - 4]):
             put(h - detail_h + 2 + i, 3,
                 f"{fmt_age(now - mt):>4} ago  {rel}", curses.color_pair(3))
@@ -1627,7 +2079,8 @@ def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies):
                      else a.tty + (" DETACHED — [o] to reopen" if a.detached else ""))
             put(h - detail_h + 2 + min(len(p.recent), detail_h - 4) + j, 3,
                 f"agent: {a.name} pid {a.pid} in {where}, "
-                f"idle {fmt_age(a.eff_idle())}, cpu {a.cpu:.0f}%"
+                f"idle {fmt_age(a.eff_idle())}, cpu {a.cpu:.0f}% "
+                f"(terminal {a.work_cpu:.0f}%)"
                 + (" [protected]" if a.protected else "")
                 + (" [left alone]" if a.policy == "ignore" else ""),
                 curses.color_pair(2))
@@ -1642,49 +2095,577 @@ def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies):
     return sel, projects
 
 
+def nudge_for(agent, agent_cfg, nudges):
+    return (match_policy(agent.host, agent.cwd, nudges, None)
+            or agent_cfg["nudge"]) if agent.cwd else agent_cfg["nudge"]
+
+
+def prod_succeeded(msg):
+    """Whether the nudge actually reached an agent terminal."""
+    return msg.startswith(("prodded ", "approved prompt of "))
+
+
+# ---------------------------------------------------- nudge experiment / log
+
+def _empty_stat():
+    return {"sent": 0, "productive": 0, "restalled": 0, "dropped": 0,
+            "up": 0, "down": 0}
+
+
+def stat_good(s):
+    """'good' = prods that produced real work. Each prod counts once; a
+    thumbs-up reclassifies its outcome to productive rather than adding on
+    top (so the rate can never exceed 100%). up/down are kept only as a tally
+    of how many outcomes you corrected by hand."""
+    return s.get("productive", 0)
+
+
+def stat_rate(s):
+    return stat_good(s) / s["sent"] if s.get("sent") else 0.0
+
+
+class ProdLog:
+    """Records every nudge prodder sends and, a few minutes later, whether the
+    agent produced real work — so the dashboard can rank phrasings and the
+    bandit can prefer the ones that actually unstick agents.
+
+    'good'  = files appeared in the project after the prod (or a thumbs-up).
+    'restalled' = agent stayed put, no output, until the outcome window closed.
+    'dropped'   = the agent vanished/was closed with nothing produced.
+    Outcomes are heuristic (prodtop is a file-activity monitor, so file output
+    is the signal); the thumbs up/down let you correct them by hand."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.dir = Path(cfg["_dir"])
+        self.events_path = self.dir / "prodder-events.jsonl"
+        self.stats_path = self.dir / "prodder-stats.json"
+        self.lock = threading.Lock()
+        self.open_events = []                 # awaiting an outcome
+        self.recent = deque(maxlen=50)        # newest first, for the dashboard
+        self.by_id = {}
+        self.stats = self._load_stats()
+        self._n = 0
+
+    def _load_stats(self):
+        try:
+            with open(self.stats_path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_stats(self):
+        try:
+            with open(self.stats_path, "w") as f:
+                json.dump(self.stats, f, indent=1)
+        except OSError:
+            pass
+
+    def _append_event(self, ev):
+        try:
+            with open(self.events_path, "a") as f:
+                f.write(json.dumps(ev) + "\n")
+        except OSError:
+            pass
+
+    def pick(self, pool, epsilon):
+        """Epsilon-greedy: explore at rate epsilon, else the best good-rate
+        (smoothed so an untried phrasing starts optimistic and gets sampled)."""
+        pool = [n for n in pool if n] or [self.cfg["agents"]["nudge"]]
+        if random.random() < epsilon:
+            return random.choice(pool)
+        best, best_score = pool[0], -1.0
+        for n in pool:
+            s = self.stats.get(n, {})
+            score = (stat_good(s) + 1) / (s.get("sent", 0) + 2)   # prior 0.5
+            if score > best_score:
+                best_score, best = score, n
+        return best
+
+    def record(self, agent, nudge, kind, auto):
+        with self.lock:
+            self._n += 1
+            proj = os.path.basename(agent.cwd.rstrip("/")) or agent.host
+            ev = {"id": f"e{self._n}", "t": time.time(), "host": agent.host,
+                  "path": agent.cwd, "project": proj, "agent": agent.name,
+                  "pid": agent.pid, "tty": agent.tty, "nudge": nudge,
+                  "kind": kind, "auto": auto,
+                  "idle_before": round(max(0.0, agent.eff_idle()), 1),
+                  "outcome": None, "human": None}
+            self.open_events.append(ev)
+            self.recent.appendleft(ev)
+            self.by_id[ev["id"]] = ev
+            self.stats.setdefault(nudge, _empty_stat())["sent"] += 1
+            self._append_event(ev)
+            self._save_stats()
+            return ev
+
+    def _finish(self, ev, outcome):
+        ev["outcome"] = outcome
+        s = self.stats.setdefault(ev["nudge"], _empty_stat())
+        s[outcome] = s.get(outcome, 0) + 1
+        self._append_event({**ev, "resolved": True})
+        self._save_stats()
+
+    def resolve(self, proj_mtime, live, now, window):
+        """proj_mtime: {(host, projpath): latest_mtime}; live: set of
+        (host, pid) still running. Attribute each open prod's outcome."""
+        with self.lock:
+            for ev in list(self.open_events):
+                if ev["outcome"] is not None:
+                    self.open_events.remove(ev)
+                    continue
+                produced = any(
+                    h == ev["host"] and (ev["path"] == pp
+                                         or ev["path"].startswith(pp + "/")
+                                         or pp.startswith(ev["path"]))
+                    and mt > ev["t"] + 2
+                    for (h, pp), mt in proj_mtime.items())
+                alive = (ev["host"], ev["pid"]) in live
+                age = now - ev["t"]
+                if produced:
+                    self._finish(ev, "productive")
+                elif not alive and age > 15:
+                    self._finish(ev, "dropped")
+                elif age >= window:
+                    self._finish(ev, "restalled" if alive else "dropped")
+                else:
+                    continue
+                self.open_events.remove(ev)
+
+    def feedback(self, event_id, good):
+        """Thumbs re-label an outcome: up -> productive, down -> restalled.
+        Reclassifying (not adding) keeps each prod counted exactly once."""
+        with self.lock:
+            ev = self.by_id.get(event_id)
+            if not ev:
+                return False
+            s = self.stats.setdefault(ev["nudge"], _empty_stat())
+            target = "productive" if good else "restalled"
+            cur = ev.get("outcome")
+            if cur != target:
+                if cur in ("productive", "restalled", "dropped"):
+                    s[cur] = max(0, s.get(cur, 0) - 1)
+                s[target] = s.get(target, 0) + 1
+                ev["outcome"] = target
+                if ev in self.open_events:
+                    self.open_events.remove(ev)   # a hand-labelled prod is resolved
+            prev = ev.get("human")
+            if prev is True:
+                s["up"] = max(0, s.get("up", 0) - 1)
+            elif prev is False:
+                s["down"] = max(0, s.get("down", 0) - 1)
+            ev["human"] = bool(good)
+            s["up" if good else "down"] += 1
+            self._append_event({**ev, "feedback": True})
+            self._save_stats()
+            return True
+
+    def leaderboard(self):
+        with self.lock:
+            rows = []
+            for nudge, s in self.stats.items():
+                rows.append({"nudge": nudge, "sent": s.get("sent", 0),
+                             "good": stat_good(s), "rate": stat_rate(s),
+                             "productive": s.get("productive", 0),
+                             "restalled": s.get("restalled", 0),
+                             "dropped": s.get("dropped", 0),
+                             "up": s.get("up", 0), "down": s.get("down", 0)})
+            rows.sort(key=lambda r: (-r["rate"], -r["sent"]))
+            return rows
+
+    def recent_events(self, n=12):
+        with self.lock:
+            return [dict(e) for e in list(self.recent)[:n]]
+
+
+def choose_nudge(agent, agent_cfg, nudges, screen, prodlog):
+    """Which phrasing to send, and why. Custom per-project nudge wins; a screen
+    that looks finished/awaiting-a-decision gets the reassess off-ramp; else the
+    bandit picks from the pool."""
+    custom = match_policy(agent.host, agent.cwd, nudges, None) if agent.cwd else None
+    if custom:
+        return custom, "custom"
+    if screen and looks_done(screen):
+        return agent_cfg["reassess_nudge"], "reassess"
+    pool = agent_cfg.get("nudge_pool") or [agent_cfg["nudge"]]
+    if prodlog is not None:
+        return prodlog.pick(pool, agent_cfg.get("bandit_epsilon", 0.15)), "pool"
+    return pool[0], "pool"
+
+
+def experiment_prod(agent, cfg, nudges, prodlog, auto=False):
+    """Prod an agent with an experiment-chosen nudge and log the outcome.
+    Falls back to the plain default for web tabs (no idle/output signal)."""
+    agent_cfg = cfg["agents"]
+    if agent.protected:
+        return prod_agent(agent, "", agent_cfg["approve_prompts"],
+                          agent_cfg["never_approve"])
+    if agent.web:
+        return prod_agent(agent, nudge_for(agent, agent_cfg, nudges or {}),
+                          agent_cfg["approve_prompts"], agent_cfg["never_approve"])
+    screen = capture_screen(agent)
+    text, kind = choose_nudge(agent, agent_cfg, nudges or {}, screen, prodlog)
+    msg = prod_agent(agent, text, agent_cfg["approve_prompts"],
+                     agent_cfg["never_approve"], screen=screen)
+    if prodlog is not None and prod_succeeded(msg) and "approved prompt" not in msg:
+        prodlog.record(agent, text, kind, auto)
+    return msg
+
+
 def auto_prod_pass(agents, agent_cfg, last_prod, msgs,
-                   pending_remote=None, remote_timeout=300):
+                   pending_remote=None, remote_timeout=300, nudges=None,
+                   stale_tracker=None, recovery_attempts=None, cfg=None,
+                   prodlog=None):
     now = time.time()
+    recovery_attempts = recovery_attempts if recovery_attempts is not None else {}
     for a in agents:
-        if not effective_stalled(a, agent_cfg["idle_after"]):
+        if stale_tracker is not None:
+            is_stale = stale_tracker.ready(a, agent_cfg, now)
+        else:
+            is_stale = effective_stalled(a, agent_cfg["idle_after"])
+        if not is_stale:
             continue
         if pending_remote and now - pending_remote.get((a.host, a.tty), 0) \
                 < remote_timeout:
             continue        # a human was asked on the phone — hold off
         key = (a.host, a.pid)
+        fingerprint = stale_tracker.fingerprint(a) if stale_tracker else ""
+        prior = recovery_attempts.get(key)
+        if prior and prior["fingerprint"] != fingerprint:
+            recovery_attempts.pop(key, None)  # visible progress reset recovery
+            prior = None
         if now - last_prod.get(key, 0) < agent_cfg["prod_cooldown"]:
             continue
-        msg = prod_agent(a, agent_cfg["nudge"], agent_cfg["approve_prompts"],
-                         agent_cfg["never_approve"])
+        if prior and prior["attempts"] >= agent_cfg["auto_restart_attempts"]:
+            msg = recover_agent(a, cfg)
+            recovery_attempts.pop(key, None)
+            last_prod[key] = now
+            msgs.append(f"[auto {time.strftime('%H:%M')}] " + msg)
+            continue
+        msg = experiment_prod(a, cfg, nudges or {}, prodlog, auto=True)
         # an approved prompt usually precedes more work (or another prompt) —
         # recheck soon instead of waiting out the full cooldown
-        last_prod[key] = (now - agent_cfg["prod_cooldown"] + 90
-                          if "approved prompt" in msg else now)
+        if prod_succeeded(msg):
+            last_prod[key] = (now - agent_cfg["prod_cooldown"] + 90
+                              if "approved prompt" in msg else now)
+            recovery_attempts[key] = {
+                "fingerprint": fingerprint,
+                "attempts": (prior["attempts"] + 1 if prior else 1),
+            }
         msgs.append(f"[auto {time.strftime('%H:%M')}] " + msg)
 
 
+class AutoProdder(threading.Thread):
+    """Run expensive stale detection away from the curses/UI thread."""
+    def __init__(self, cfg, state, state_lock, policies, nudges,
+                 pending_remote, last_prod, msgs, prodlog=None):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.state, self.state_lock = state, state_lock
+        self.policies, self.nudges = policies, nudges
+        self.pending_remote, self.last_prod, self.msgs = (
+            pending_remote, last_prod, msgs)
+        self.prodlog = prodlog
+        self.stale_tracker = SafeStaleTracker()
+        self.recovery_attempts = {}
+        self.stopping = threading.Event()
+
+    def stop(self):
+        self.stopping.set()
+
+    def _resolve_outcomes(self, now):
+        """Attribute outcomes to prods whose window has matured."""
+        if self.prodlog is None:
+            return
+        with self.state_lock:
+            proj_mtime, live = {}, set()
+            for hs in self.state.values():
+                for p in hs.projects.values():
+                    proj_mtime[(p.host, row_path(p))] = p.latest_mtime
+                for a in hs.agents:
+                    live.add((a.host, a.pid))
+        self.prodlog.resolve(proj_mtime, live, now,
+                             self.cfg["agents"].get("outcome_window", 240))
+
+    def run(self):
+        agent_cfg, remote_cfg = self.cfg["agents"], self.cfg["remote"]
+        while not self.stopping.is_set():
+            try:
+                self._resolve_outcomes(time.time())
+                if agent_cfg["auto_prod"]:
+                    with self.state_lock:
+                        agents = [a for hs in self.state.values() for a in hs.agents]
+                        apply_policies(agents, self.policies)
+                    auto_prod_pass(agents, agent_cfg, self.last_prod, self.msgs,
+                                   self.pending_remote, remote_cfg["remote_timeout"],
+                                   self.nudges, self.stale_tracker,
+                                   self.recovery_attempts, self.cfg, self.prodlog)
+            except Exception as e:
+                self.msgs.append(f"auto-prod: {str(e)[:80]}")
+            interval = max(1.0, float(agent_cfg["auto_interval"]))
+            self.stopping.wait(interval)
+
+
+# ------------------------------------------------------------------- demo
+
+# A fabricated fleet so a first-time user sees the whole thing — dashboard,
+# stalls, auto-prods, the Nudge Lab filling in — with no config, no ssh, no
+# real agents. Each nudge has a hidden "true" success rate; the bandit is left
+# to discover it, so the leaderboard tells the product's own story live.
+DEMO_HOSTS = ["laptop", "gpu-box", "vps"]
+DEMO_PROJECTS = [
+    ("laptop", "checkout-flow", True, "PROD"),
+    ("laptop", "api-gateway", True, "PROD"),
+    ("laptop", "design-system", True, "leave"),
+    ("laptop", "marketing-site", False, "leave"),
+    ("gpu-box", "train-ranker", True, "PROD"),
+    ("gpu-box", "eval-harness", False, "leave"),
+    ("vps", "billing-worker", True, "PROD"),
+    ("vps", "cron-scripts", False, "leave"),
+]
+DEMO_QUALITY = {                      # hidden truth the bandit has to find
+    "Please keep going with the current plan.": 0.85,
+    "reassess": 0.80,
+    "continue!": 0.62,
+    "What's the next concrete step? Do it.": 0.55,
+    "continue": 0.42,
+    "Proceed.": 0.30,
+}
+DEMO_FILES = ["src/router.ts", "app/models.py", "tests/test_flow.py",
+              "README.md", "lib/pipeline.py", "components/Button.tsx",
+              "train.py", "worker/jobs.py", "config.yaml", "utils/io.rs"]
+DEMO_SCREENS = ["editing files, working through the plan",
+                "running the test suite", "refactoring the module"]
+DEMO_DONE = ["All done! Let me know if you'd like anything else.",
+             "Task complete. Shall I deploy?"]
+
+
+class DemoDriver(threading.Thread):
+    """Evolves a fake fleet and simulates prods + outcomes on a fast clock."""
+
+    def __init__(self, cfg, state, lock, policies, nudges, last_prod, msgs,
+                 prodlog):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.state, self.lock = state, lock
+        self.policies, self.nudges = policies, nudges
+        self.last_prod, self.msgs, self.prodlog = last_prod, msgs, prodlog
+        self.stopping = threading.Event()
+        self.pid = 4000
+        self._build()
+
+    def stop(self):
+        self.stopping.set()
+
+    def _rand_buckets(self):
+        return [random.choice([0, 0, 0, 1, 1, 2, 3, 5]) for _ in range(SPARK_BUCKETS)]
+
+    def _build(self):
+        now = time.time()
+        for h in DEMO_HOSTS:
+            self.state[h] = HostState(name=h, ok=True, last_scan=now)
+        for host, name, has_agent, mode in DEMO_PROJECTS:
+            root = {"laptop": "/Users/you/Projects", "gpu-box": "/home/you/ml",
+                    "vps": "/srv"}[host]
+            buckets = self._rand_buckets()
+            p = Project(name=name, host=host, root=root,
+                        latest_mtime=now - random.randint(20, 4000),
+                        latest_file=random.choice(DEMO_FILES),
+                        counts={"15m": buckets[0], "1h": sum(buckets[:2]),
+                                "24h": sum(buckets), "3d": sum(buckets) + random.randint(0, 40)},
+                        buckets=buckets,
+                        recent=[(now - i * 180 - 30, random.choice(DEMO_FILES))
+                                for i in range(4)])
+            self.policies[f"{host}|{root.rstrip('/')}/{name}"] = (
+                "auto" if mode == "PROD" else "ignore")
+            if has_agent:
+                self.pid += 1
+                a = AgentProc(host=host, ssh="", pid=self.pid, name=random.choice(
+                    ["claude", "codex"]), cwd=f"{root}/{name}",
+                    tty=f"/dev/ttys{self.pid}", cpu=random.choice([0.0, 2.0, 8.0]),
+                    idle=float(random.randint(0, 30)), scanned_at=now)
+                self.state[host].agents.append(a)
+                p.agents.append(a)
+            self.state[host].projects[name] = p
+
+    def _agents(self):
+        return [a for hs in self.state.values() for a in hs.agents]
+
+    def _tick(self):
+        now = time.time()
+        acfg = self.cfg["agents"]
+        with self.lock:
+            for hs in self.state.values():
+                hs.last_scan = now
+            for a in self._agents():
+                a.scanned_at = now
+                a.idle += random.uniform(1.5, 3.5)
+                # projects that are "working" keep producing files
+                proj = self._proj_for(a)
+                if a.idle < acfg["idle_after"] and proj and random.random() < 0.4:
+                    self._produce(proj, now)
+            if not acfg["auto_prod"]:
+                return
+            apply_policies(self._agents(), self.policies)
+            for a in self._agents():
+                if a.policy == "ignore" or a.idle < acfg["idle_after"]:
+                    continue
+                key = (a.host, a.pid)
+                if now - self.last_prod.get(key, 0) < acfg["prod_cooldown"]:
+                    continue
+                self._prod(a, now, auto=True)
+            self._resolve(now)
+
+    def _proj_for(self, a):
+        for p in self.state[a.host].projects.values():
+            if a.cwd.endswith("/" + p.name):
+                return p
+        return None
+
+    def _produce(self, proj, now):
+        proj.latest_mtime = now
+        proj.latest_file = random.choice(DEMO_FILES)
+        proj.buckets = proj.buckets[:-1]
+        proj.buckets.insert(0, proj.buckets[0] + 1)
+        for k in ("15m", "1h", "24h", "3d"):
+            proj.counts[k] = proj.counts.get(k, 0) + 1
+        proj.recent.insert(0, (now, proj.latest_file))
+        proj.recent = proj.recent[:8]
+
+    def _prod(self, a, now, auto):
+        acfg = self.cfg["agents"]
+        done = random.random() < 0.18
+        screen = random.choice(DEMO_DONE if done else DEMO_SCREENS)
+        text, kind = choose_nudge(a, acfg, self.nudges, screen, self.prodlog)
+        self.prodlog.record(a, text, kind, auto)
+        self.last_prod[(a.host, a.pid)] = now
+        quality = DEMO_QUALITY.get("reassess" if kind == "reassess" else text, 0.5)
+        proj = self._proj_for(a)
+        if random.random() < quality:               # nudge worked
+            a.idle = float(random.randint(0, 3))
+            a.cpu = random.choice([4.0, 9.0])
+            if proj:
+                self._produce(proj, now + 1)         # output lands just after
+        else:                                        # stayed stuck
+            a.idle = float(acfg["idle_after"] + random.randint(2, 8))
+        verb = "reassessed" if kind == "reassess" else "prodded"
+        self.msgs.append(f"[demo {time.strftime('%H:%M:%S')}] {verb} "
+                         f"{a.name}/{proj.name if proj else a.host} — \"{text[:32]}\"")
+
+    def _resolve(self, now):
+        proj_mtime, live = {}, set()
+        for hs in self.state.values():
+            for p in hs.projects.values():
+                proj_mtime[(p.host, row_path(p))] = p.latest_mtime
+            for a in hs.agents:
+                live.add((a.host, a.pid))
+        self.prodlog.resolve(proj_mtime, live, now,
+                             self.cfg["agents"].get("outcome_window", 15))
+
+    def act(self, action, a=None, proj=None):
+        """Simulate a dashboard action without touching the real system."""
+        now = time.time()
+        with self.lock:
+            if action == "prod" and a:
+                self._prod(a, now, auto=False)
+                return f"prodded {a.name} (demo)"
+            if action == "type" and a:
+                a.idle = 0.0
+                return f"sent keystrokes to {a.name} (demo)"
+            if action in ("close", "reopen") and a:
+                for hs in self.state.values():
+                    hs.agents = [x for x in hs.agents if x.pid != a.pid]
+                return f"{action}d {a.name} (demo)"
+        return "ok"
+
+    def run(self):
+        # warm the leaderboard so the lab isn't empty on first paint
+        with self.lock:
+            for a in self._agents():
+                for _ in range(random.randint(2, 5)):
+                    self._prod(a, time.time() - random.randint(30, 400), auto=True)
+            self._resolve(time.time())
+        while not self.stopping.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                self.msgs.append(f"demo: {str(e)[:80]}")
+            self.stopping.wait(2.5)
+
+
+class Engine:
+    """The shared runtime behind every interface: per-host scanner threads,
+    the auto-prodder, and the phone answerer. UIs (curses TUI, web) only
+    read state and call actions. With demo=True, real scanning/prodding is
+    replaced by a self-contained simulation (see DemoDriver)."""
+
+    def __init__(self, cfg, demo=False):
+        self.cfg = cfg
+        self.demo = demo
+        self.state, self.lock = {}, threading.Lock()
+        self.wake = threading.Event()
+        self.scanners = []
+        self.last_prod, self.msgs = {}, deque(maxlen=30)
+        self.policies, self.nudges = ({}, {}) if demo else load_state(cfg)
+        self.prodlog = ProdLog(cfg)
+        self.pending_remote = {}
+        self.remote_thread = None
+        if demo:
+            self.driver = DemoDriver(cfg, self.state, self.lock, self.policies,
+                                     self.nudges, self.last_prod, self.msgs,
+                                     self.prodlog)
+            return
+        for hc in cfg["hosts"]:
+            self.state[hc["name"]] = HostState(name=hc["name"])
+            self.scanners.append(Scanner(hc, cfg["settings"], cfg["agents"],
+                                         self.state, self.lock, self.wake))
+        if cfg["remote"]["enabled"] and (cfg["remote"]["telegram_token"]
+                                         or cfg["remote"]["imessage_handle"]):
+            self.remote_thread = RemoteAnswerer(cfg, self.state, self.lock,
+                                                self.msgs, self.pending_remote,
+                                                self.policies)
+        self.auto_thread = AutoProdder(cfg, self.state, self.lock,
+                                       self.policies, self.nudges,
+                                       self.pending_remote, self.last_prod,
+                                       self.msgs, self.prodlog)
+
+    def start(self):
+        if self.demo:
+            self.driver.start()
+            return
+        for t in self.scanners:
+            t.start()
+        if self.remote_thread:
+            self.remote_thread.start()
+        self.auto_thread.start()
+
+    def stop(self):
+        if self.demo:
+            self.driver.stop()
+            return
+        for t in self.scanners:
+            t.stop = True
+        self.auto_thread.stop()
+        if self.remote_thread:
+            self.remote_thread.stop = True
+        self.wake.set()
+
+    def drop_agent(self, a):
+        with self.lock:
+            for hs in self.state.values():
+                hs.agents = [x for x in hs.agents
+                             if (x.host, x.tty) != (a.host, a.tty)]
+
+
 def tui(cfg):
-    state, lock = {}, threading.Lock()
-    wake = threading.Event()
-    scanners = []
-    for hc in cfg["hosts"]:
-        state[hc["name"]] = HostState(name=hc["name"])
-        t = Scanner(hc, cfg["settings"], cfg["agents"], state, lock, wake)
-        scanners.append(t)
-        t.start()
-    last_prod, msgs = {}, deque(maxlen=5)
-    last_auto = 0.0
-    policies = load_policies(cfg)
-    pending_remote = {}
-    remote_thread = None
-    if cfg["remote"]["enabled"] and (cfg["remote"]["telegram_token"]
-                                     or cfg["remote"]["imessage_handle"]):
-        remote_thread = RemoteAnswerer(cfg, state, lock, msgs,
-                                       pending_remote, policies)
-        remote_thread.start()
+    eng = Engine(cfg)
+    eng.start()
+    state, lock, wake = eng.state, eng.lock, eng.wake
+    last_prod, msgs = eng.last_prod, eng.msgs
+    policies, nudges = eng.policies, eng.nudges
 
     def main(scr):
-        nonlocal last_auto
         curses.curs_set(0)
         curses.start_color()
         curses.use_default_colors()
@@ -1705,25 +2686,14 @@ def tui(cfg):
                 msgs.append(f"no agent running in {rows[sel].name}")
             return None, None
 
-        def drop_from_state(a):
-            with lock:
-                for hs in state.values():
-                    hs.agents = [x for x in hs.agents
-                                 if (x.host, x.tty) != (a.host, a.tty)]
+        drop_from_state = eng.drop_agent
 
         while True:
             ui_msg = msgs[-1] if msgs else ""
             sel, rows = draw(scr, state, lock, sel, sel_key, sort_by,
-                             cfg["agents"], ui_msg, policies)
+                             cfg["agents"], ui_msg, policies, nudges, last_prod)
             if rows:
                 sel_key = (rows[sel].host, row_path(rows[sel]))
-            if cfg["agents"]["auto_prod"] and time.time() - last_auto > 10:
-                last_auto = time.time()
-                with lock:
-                    agents = [a for hs in state.values() for a in hs.agents]
-                    apply_policies(agents, policies)
-                auto_prod_pass(agents, cfg["agents"], last_prod, msgs,
-                               pending_remote, cfg["remote"]["remote_timeout"])
             ch = scr.getch()
             if pending is not None and ch != -1:
                 action, a = pending
@@ -1753,15 +2723,14 @@ def tui(cfg):
             elif ch == ord("p"):
                 _, a = sel_agent(rows)
                 if a:
-                    msgs.append(f"[{time.strftime('%H:%M')}] "
-                                + prod_agent(a, cfg["agents"]["nudge"],
-                                             cfg["agents"]["approve_prompts"],
-                                             cfg["agents"]["never_approve"]))
-                    last_prod[(a.host, a.pid)] = time.time()
+                    msg = experiment_prod(a, cfg, nudges, eng.prodlog)
+                    msgs.append(f"[{time.strftime('%H:%M')}] " + msg)
+                    if prod_succeeded(msg):
+                        last_prod[(a.host, a.pid)] = time.time()
             elif ch == ord("i") and rows:
                 p = rows[sel]
                 policies[f"{p.host}|{row_path(p)}"] = "ignore"
-                save_policies(cfg, policies)
+                save_state(cfg, policies, nudges)
                 msgs.append(f"{p.name}: MODE = leave (never prodded)")
             elif ch == ord("a") and rows:
                 p = rows[sel]
@@ -1771,8 +2740,38 @@ def tui(cfg):
                 # still match — pin an explicit auto so most-specific wins
                 if match_policy(p.host, row_path(p), policies) != "auto":
                     policies[key] = "auto"
-                save_policies(cfg, policies)
+                save_state(cfg, policies, nudges)
                 msgs.append(f"{p.name}: MODE = PROD (stalled agents here get prodded)")
+            elif ch == ord("n") and rows:
+                p = rows[sel]
+                key = f"{p.host}|{row_path(p)}"
+                txt = read_line(scr, f"nudge for {p.name} (Enter empty = "
+                                     f"default '{cfg['agents']['nudge']}', "
+                                     f"ESC = cancel): ",
+                                nudges.get(key, ""))
+                if txt is None:
+                    msgs.append("nudge unchanged")
+                elif not txt.strip():
+                    nudges.pop(key, None)
+                    save_state(cfg, policies, nudges)
+                    msgs.append(f"{p.name}: nudge reset to default "
+                                f"'{cfg['agents']['nudge']}'")
+                else:
+                    nudges[key] = txt.strip()
+                    save_state(cfg, policies, nudges)
+                    msgs.append(f"{p.name}: nudge = \"{txt.strip()[:50]}\"")
+            elif ch == ord("t"):
+                p, a = sel_agent(rows)
+                if a:
+                    txt = read_line(scr, f"type into {a.name}/{p.name} "
+                                         f"(Enter = send, ESC = cancel): ")
+                    if txt and txt.strip():
+                        err = send_to_terminal(a, txt.strip(), submit=True)
+                        msgs.append(err or f"sent \"{txt.strip()[:40]}\" "
+                                           f"to {a.name}/{p.name}")
+                        last_prod[(a.host, a.pid)] = time.time()
+                    else:
+                        msgs.append("nothing sent")
             elif ch == ord("x"):
                 p, a = sel_agent(rows)
                 if a and a.protected:
@@ -1797,11 +2796,753 @@ def tui(cfg):
     try:
         curses.wrapper(main)
     finally:
-        for t in scanners:
-            t.stop = True
-        if remote_thread:
-            remote_thread.stop = True
-        wake.set()
+        eng.stop()
+
+
+# ---------------------------------------------------------------- web UI
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>prodder</title>
+<style>
+:root{
+  --bg0:#0e1218; --bg1:#161c26; --card:rgba(255,255,255,.045);
+  --card-hi:rgba(255,255,255,.07); --line:rgba(255,255,255,.08);
+  --ink:#e8ecf2; --ink2:#9aa5b4; --ink3:#5f6b7c;
+  --accent:#f0862d; --accent2:#f59a4a; --good:#3fbf6f; --warn:#e8b93e;
+  --bad:#e5484d; --r:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{color-scheme:dark}
+body{
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",Segoe UI,sans-serif;
+  color:var(--ink); background:var(--bg0); min-height:100vh;
+  background-image:
+    radial-gradient(900px 500px at 85% -10%, rgba(240,134,45,.13), transparent 60%),
+    radial-gradient(700px 500px at -10% 110%, rgba(63,120,240,.08), transparent 60%),
+    linear-gradient(180deg,var(--bg1),var(--bg0) 40%);
+  background-attachment:fixed;
+  font-variant-numeric:tabular-nums;
+}
+header{
+  position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:14px;
+  padding:12px 20px;backdrop-filter:blur(18px) saturate(1.3);
+  background:rgba(14,18,24,.72);border-bottom:1px solid var(--line);
+}
+.logo{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;
+  letter-spacing:.2px}
+.logo svg{filter:drop-shadow(0 1px 4px rgba(240,134,45,.5));
+  transform-origin:80% 20%}
+.logo.prodding svg{animation:swing .55s ease}
+@keyframes swing{0%{transform:rotate(0)}25%{transform:rotate(-14deg)}
+  60%{transform:rotate(9deg)}100%{transform:rotate(0)}}
+.pills{display:flex;gap:8px;flex-wrap:wrap}
+.pill{display:flex;align-items:center;gap:6px;padding:3px 10px;border-radius:99px;
+  background:var(--card);border:1px solid var(--line);color:var(--ink2);font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ink3)}
+.dot.ok{background:var(--good);box-shadow:0 0 6px rgba(63,191,111,.7)}
+.dot.err{background:var(--bad);box-shadow:0 0 6px rgba(229,72,77,.6)}
+.dot.scan{background:var(--warn);animation:pulse 1s infinite alternate}
+@keyframes pulse{from{opacity:.4}to{opacity:1}}
+.spacer{flex:1}
+.stat{color:var(--ink2);font-size:12px}
+.stat b{color:var(--ink);font-size:14px}
+.stat .stalled{color:var(--warn)}
+.seg{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.seg button{background:transparent;border:0;color:var(--ink2);padding:5px 12px;
+  font:inherit;font-size:12px;cursor:pointer}
+.seg button.on{background:var(--card-hi);color:var(--ink)}
+.switch{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink2);
+  cursor:pointer;user-select:none}
+.track{width:34px;height:20px;border-radius:99px;background:var(--card-hi);
+  border:1px solid var(--line);position:relative;transition:.18s}
+.track::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;
+  border-radius:50%;background:var(--ink2);transition:.18s}
+.switch.on .track{background:linear-gradient(135deg,var(--accent2),var(--accent));
+  border-color:transparent;box-shadow:0 1px 10px rgba(240,134,45,.45)}
+.switch.on .track::after{left:16px;background:#fff}
+.iconbtn{background:transparent;border:1px solid var(--line);border-radius:9px;
+  color:var(--ink2);width:30px;height:30px;cursor:pointer;font-size:14px}
+.iconbtn:hover{color:var(--ink);background:var(--card)}
+#ticker{padding:6px 22px;font-size:12px;color:var(--ink2);cursor:pointer;
+  border-bottom:1px solid rgba(255,255,255,.04);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+#ticker:empty{display:none}
+main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
+  flex-direction:column;gap:10px}
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  transition:background .15s, transform .15s, box-shadow .15s;
+  backdrop-filter:blur(14px);
+}
+.card:hover{background:var(--card-hi);transform:translateY(-1px);
+  box-shadow:0 8px 28px rgba(0,0,0,.35)}
+.rowmain{display:grid;grid-template-columns:minmax(180px,1.2fr) 74px minmax(150px,1fr)
+  200px 130px minmax(140px,1fr);gap:14px;align-items:center;padding:12px 16px;
+  cursor:pointer}
+.pname{font-weight:600;display:flex;align-items:center;gap:9px;min-width:0}
+.pname .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.host{font-size:11px;color:var(--ink3);border:1px solid var(--line);
+  border-radius:6px;padding:1px 6px;flex:none}
+.mode{font-size:11px;font-weight:700;letter-spacing:.6px;border-radius:99px;
+  padding:4px 11px;border:1px solid var(--line);color:var(--ink3);background:transparent;
+  cursor:pointer;font-family:inherit}
+.mode.prod{background:linear-gradient(135deg,var(--accent2),var(--accent));
+  color:#fff;border-color:transparent;box-shadow:0 1px 10px rgba(240,134,45,.4)}
+.agent{font-size:12.5px;color:var(--ink2);display:flex;align-items:center;gap:7px;
+  min-width:0}
+.agent .st{flex:none;width:8px;height:8px;border-radius:50%}
+.st.run{background:var(--good);box-shadow:0 0 6px rgba(63,191,111,.6)}
+.st.stalled{background:var(--warn);box-shadow:0 0 6px rgba(232,185,62,.6)}
+.st.off{background:var(--ink3)} .st.det{background:var(--bad)}
+.st.term{background:transparent;box-shadow:inset 0 0 0 1.5px var(--ink3)}
+.agent .txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.counts{display:flex;gap:0;color:var(--ink3);font-size:12px}
+.counts div{width:46px;text-align:right}
+.counts .big{color:var(--ink);font-weight:600}
+.spark{display:block}
+.spark rect{fill:var(--accent);opacity:.9}
+.spark line{stroke:rgba(255,255,255,.12)}
+.lastf{font-size:12px;color:var(--ink2);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;text-align:right}
+.lastf span{color:var(--ink3)}
+.detail{border-top:1px solid var(--line);padding:12px 16px;display:flex;
+  flex-direction:column;gap:10px}
+.files{font-size:12px;color:var(--ink2);display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:3px 20px}
+.files>div{display:flex;gap:6px;align-items:baseline;min-width:0}
+.files .age{color:var(--ink3);flex:none;width:52px}
+.files .fp{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;direction:rtl;text-align:left}
+.aline{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12.5px;
+  color:var(--ink2);padding:7px 10px;border-radius:10px;background:rgba(0,0,0,.18)}
+.btn{font:inherit;font-size:12px;font-weight:600;border-radius:8px;cursor:pointer;
+  padding:5px 12px;border:1px solid var(--line);background:var(--card-hi);
+  color:var(--ink);transition:.12s}
+.btn:hover{background:rgba(255,255,255,.12)}
+.btn.hot{background:linear-gradient(135deg,var(--accent2),var(--accent));
+  border-color:transparent;color:#fff;box-shadow:0 1px 10px rgba(240,134,45,.4)}
+.btn.hot:hover{filter:brightness(1.1)}
+.btn.danger:hover{background:rgba(229,72,77,.25);border-color:rgba(229,72,77,.4)}
+.inline-form{display:flex;gap:8px;width:100%}
+.inline-form input{flex:1;font:inherit;font-size:13px;color:var(--ink);
+  background:rgba(0,0,0,.3);border:1px solid var(--line);border-radius:8px;
+  padding:6px 10px;outline:none}
+.inline-form input:focus{border-color:var(--accent)}
+#log{position:fixed;right:18px;bottom:18px;width:420px;max-height:300px;
+  overflow:auto;background:rgba(14,18,24,.92);border:1px solid var(--line);
+  border-radius:var(--r);backdrop-filter:blur(20px);padding:12px 14px;z-index:20;
+  font-size:12px;color:var(--ink2);display:none;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+#log.show{display:block}
+#log div{padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.empty{color:var(--ink3);text-align:center;padding:60px 0;font-size:13px}
+/* Nudge Lab */
+#lab{display:none;margin:0 0 4px}
+#lab.show{display:block}
+.lab-grid{display:grid;grid-template-columns:1.3fr 1fr;gap:14px}
+@media(max-width:820px){.lab-grid{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  padding:14px 16px;backdrop-filter:blur(14px);min-width:0}
+.panel h3{font-size:12px;font-weight:700;letter-spacing:.5px;color:var(--ink2);
+  text-transform:uppercase;margin-bottom:12px;display:flex;gap:8px;align-items:center}
+.panel h3 .hint{font-weight:400;text-transform:none;letter-spacing:0;
+  color:var(--ink3)}
+.bar{margin:9px 0}
+.bar .top{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;
+  margin-bottom:4px;min-width:0}
+.bar .nudge{color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;min-width:0}
+.bar .pct{color:var(--ink);font-weight:700;flex:none}
+.bar .track2{height:9px;border-radius:99px;background:rgba(255,255,255,.06);
+  overflow:hidden}
+.bar .fill{height:100%;border-radius:99px;
+  background:linear-gradient(90deg,var(--accent),var(--accent2));
+  box-shadow:0 0 10px rgba(240,134,45,.35);transition:width .5s ease}
+.bar .sub{font-size:11px;color:var(--ink3);margin-top:3px;display:flex;gap:10px}
+.bar .sub .g{color:var(--good)} .bar .sub .r{color:var(--warn)}
+.bar .sub .d{color:var(--bad)}
+.ev{display:flex;align-items:center;gap:8px;padding:6px 0;font-size:12px;
+  border-bottom:1px solid rgba(255,255,255,.04)}
+.ev .oc{flex:none;width:9px;height:9px;border-radius:50%;background:var(--ink3)}
+.oc.productive{background:var(--good)} .oc.restalled{background:var(--warn)}
+.oc.dropped{background:var(--bad)}
+.ev .txt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--ink2)}
+.ev .txt b{color:var(--ink);font-weight:600}
+.tag{font-size:10px;font-weight:700;letter-spacing:.4px;border-radius:5px;
+  padding:1px 5px;border:1px solid var(--line);color:var(--ink3);flex:none}
+.tag.reassess{color:var(--accent);border-color:rgba(240,134,45,.4)}
+.tag.custom{color:var(--good);border-color:rgba(63,191,111,.35)}
+.vote{background:transparent;border:0;cursor:pointer;font-size:13px;opacity:.5;
+  padding:0 2px}
+.vote:hover{opacity:1}
+.vote.on{opacity:1;filter:drop-shadow(0 0 4px rgba(240,134,45,.6))}
+.lab-empty{color:var(--ink3);font-size:12px;padding:8px 0}
+@media(max-width:900px){.rowmain{grid-template-columns:1fr 70px 1fr;row-gap:6px}
+  .counts,.spark,.lastf{display:none}}
+</style></head><body>
+<header>
+  <div class="logo">
+    <svg width="22" height="22" viewBox="0 0 24 24"><g>
+      <path d="M3 21 19 4" stroke="#8b5e34" stroke-width="2.6" stroke-linecap="round"/>
+      <path d="M19 4 c1.5 3.5 .5 5.5 -1.5 7" stroke="#d8d3c8" stroke-width="1.1"
+        fill="none"/>
+      <path d="M17.5 11 l2.6 1.4 -3.4 8 c-.5 1 -1.9 .6 -1.8 -.5 z" fill="#f0862d"/>
+      <path d="M17.2 10.6 l1.6 -3 1 .5 -.2 3.4 z" fill="#5cab4a"/>
+    </g></svg>
+    prodder
+  </div>
+  <div class="pills" id="hosts"></div>
+  <div class="spacer"></div>
+  <div class="stat" id="stat"></div>
+  <div class="seg" id="sortseg">
+    <button data-s="recency" class="on">Recent</button>
+    <button data-s="24h">24h</button>
+  </div>
+  <label class="switch" id="autoswitch" title="auto-prod stalled agents">
+    auto-prod <span class="track"></span>
+  </label>
+  <button class="iconbtn" id="labbtn" title="nudge lab — which prods work">🥕</button>
+  <button class="iconbtn" id="logbtn" title="message log">≡</button>
+  <button class="iconbtn" id="quitbtn" title="quit prodder">⏻</button>
+</header>
+<div id="ticker"></div>
+<main>
+  <div id="lab">
+    <div class="lab-grid">
+      <div class="panel">
+        <h3>Nudge effectiveness <span class="hint" id="labhint"></span></h3>
+        <div id="leaderboard"></div>
+      </div>
+      <div class="panel">
+        <h3>Recent prods <span class="hint">👍/👎 to teach it</span></h3>
+        <div id="events"></div>
+      </div>
+    </div>
+  </div>
+  <div id="list"><div class="empty">waiting for first scan…</div></div>
+</main>
+<div id="log"></div>
+<script>
+"use strict";
+let SORT="recency", DATA=null;
+const open=new Set(), forms={};   // key -> {kind:'type'|'nudge'}
+const $=(s,p)=>(p||document).querySelector(s);
+function el(tag,cls,text){const e=document.createElement(tag);
+  if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+function fmtAge(s){if(s==null||s<0)return"?";if(s<90)return Math.round(s)+"s";
+  if(s<5400)return Math.round(s/60)+"m";if(s<129600)return Math.round(s/3600)+"h";
+  return Math.round(s/86400)+"d"}
+async function api(body){
+  const r=await fetch("/api/action",{method:"POST",
+    headers:{"Content-Type":"application/json","X-Prodder":"1"},
+    body:JSON.stringify(body)});
+  refresh(true); return r.ok}
+async function refresh(force){
+  try{
+    const r=await fetch("/api/state?sort="+SORT); DATA=await r.json();
+  }catch(e){ $("#stat").textContent="server unreachable"; return }
+  render(force)
+}
+let hoverList=false, pendingRender=false;
+function typingNow(){const a=document.activeElement;
+  return a&&a.tagName==="INPUT"}
+function spark(buckets){
+  const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+  svg.setAttribute("class","spark");svg.setAttribute("width","120");
+  svg.setAttribute("height","26");svg.setAttribute("viewBox","0 0 120 26");
+  const b=[...buckets].reverse(), max=Math.max(1,...b);
+  const base=document.createElementNS(svg.namespaceURI,"line");
+  base.setAttribute("x1",0);base.setAttribute("y1",25.5);
+  base.setAttribute("x2",119);base.setAttribute("y2",25.5);
+  svg.appendChild(base);
+  b.forEach((v,i)=>{
+    if(v>0){
+      const h=Math.max(2,Math.round(v/max*24));
+      const r=document.createElementNS(svg.namespaceURI,"rect");
+      r.setAttribute("x",i*5);r.setAttribute("y",26-h);r.setAttribute("width",4);
+      r.setAttribute("height",h);r.setAttribute("rx",1);
+      const ti=document.createElementNS(svg.namespaceURI,"title");
+      ti.textContent=(23-i)+"h ago — "+v+" files";r.appendChild(ti);
+      svg.appendChild(r);
+    }
+  });
+  return svg
+}
+function agentLabel(a){
+  if(a.web)return[["off"],"⊘ web tab"];
+  if(a.recognized===false)return[["term"],"▹ "+a.name+" · terminal idle "+fmtAge(a.idle)];
+  if(a.protected)return[["off"],"🔒 "+a.name+" (protected)"];
+  if(a.policy==="ignore")return[["off"],"⊘ "+a.name+" "+fmtAge(a.idle)+" — left alone"];
+  if(a.detached)return[["det"],"⊗ "+a.name+" — detached"];
+  if(a.stalled){let s="⚠ "+a.name+" stalled "+fmtAge(a.idle);
+    if(a.next_prod>0)s+=" · next prod "+fmtAge(a.next_prod);
+    return[["stalled"],s]}
+  return[["run"],a.name+" active · idle "+fmtAge(a.idle)]
+}
+function inlineForm(key,kind,row,agent){
+  const f=el("div","inline-form");
+  const inp=el("input");
+  inp.placeholder=kind==="type"?("type into "+agent.name+" — Enter sends, Esc cancels")
+    :("custom nudge for "+row.name+" — empty resets to default, Esc cancels");
+  if(kind==="nudge"&&row.nudge)inp.value=row.nudge;
+  const send=el("button","btn hot",kind==="type"?"Send":"Save");
+  const cancel=el("button","btn","Cancel");
+  const done=()=>{delete forms[key];render(true)};
+  send.onclick=()=>{const v=inp.value;done();
+    if(kind==="type"){if(v.trim())api({action:"type",host:agent.host,tty:agent.tty,
+      text:v.trim()})}
+    else api({action:"nudge",host:row.host,path:row.path,text:v.trim()})};
+  cancel.onclick=done;
+  inp.onkeydown=e=>{if(e.key==="Enter")send.onclick();
+    if(e.key==="Escape")cancel.onclick()};
+  f.append(inp,send,cancel);
+  setTimeout(()=>inp.focus(),0);
+  return f
+}
+function detail(row,key){
+  const d=el("div","detail");
+  if(row.recent.length){
+    const fl=el("div","files");
+    row.recent.forEach(([age,rel])=>{
+      const line=el("div");
+      const fp=el("span","fp",rel);fp.title=rel;
+      line.append(el("span","age",fmtAge(age)+" ago"),fp);
+      fl.appendChild(line)});
+    d.appendChild(fl);
+  }
+  row.agents.forEach(a=>{
+    const line=el("div","aline");
+    const [cls,txt]=agentLabel(a);
+    const dot=el("span","st "+cls[0]);dot.className="st "+cls[0];
+    line.append(dot,el("span","",txt+"  ·  pid "+a.pid+"  ·  "+a.where
+      +"  ·  cpu "+a.cpu+"%"));
+    const sp=el("span");sp.style.flex="1";line.appendChild(sp);
+    if(!a.web&&!a.protected&&a.recognized===false){
+      // a plain window with no known agent: only offer manual Type…, never a
+      // blunt auto-prod or a Close on a shell we can't identify.
+      const bt=el("button","btn","Type…");
+      bt.onclick=e=>{e.stopPropagation();forms[key]={kind:"type",tty:a.tty};render(true)};
+      line.append(bt);
+    } else if(!a.web&&!a.protected){
+      const bp=el("button","btn hot","Prod");
+      bp.onclick=e=>{e.stopPropagation();
+        api({action:"prod",host:a.host,tty:a.tty})};
+      const bt=el("button","btn","Type…");
+      bt.onclick=e=>{e.stopPropagation();forms[key]={kind:"type",tty:a.tty};render(true)};
+      line.append(bp,bt);
+      if(a.detached){
+        const bo=el("button","btn","Reopen");
+        bo.onclick=e=>{e.stopPropagation();
+          if(confirm("Reopen "+a.name+" in a new window? Kills the detached "
+            +"session and resumes it."))
+            api({action:"reopen",host:a.host,tty:a.tty})};
+        line.appendChild(bo);
+      }
+      const bx=el("button","btn danger","Close");
+      bx.onclick=e=>{e.stopPropagation();
+        if(confirm("Close "+a.name+" (pid "+a.pid+")? Resume info is saved to "
+          +"closed-agents.md first."))
+          api({action:"close",host:a.host,tty:a.tty})};
+      line.appendChild(bx);
+    }
+    d.appendChild(line);
+  });
+  const bar=el("div","inline-form");
+  const bn=el("button","btn","Nudge…");
+  bn.onclick=e=>{e.stopPropagation();forms[key]={kind:"nudge"};render(true)};
+  bar.appendChild(bn);
+  if(row.nudge)bar.appendChild(el("span","stat",'custom nudge: "'+row.nudge+'"'));
+  d.appendChild(bar);
+  const f=forms[key];
+  if(f){
+    const agent=f.tty?row.agents.find(a=>a.tty===f.tty):null;
+    d.appendChild(inlineForm(key,f.kind,row,agent||row.agents[0]||{}));
+  }
+  return d
+}
+const OUTCOME_LABEL={productive:"produced work",restalled:"stayed stuck",
+  dropped:"agent left"};
+function renderLab(d){
+  if(!$("#lab").classList.contains("show"))return;
+  const lb=d.leaderboard||[];
+  const board=$("#leaderboard");board.textContent="";
+  const scored=lb.filter(r=>r.sent>0);
+  $("#labhint").textContent=scored.length
+    ? "share of prods that led to real file output"
+    : "";
+  if(!scored.length){
+    board.appendChild(el("div","lab-empty",
+      "No prods yet — send a few (or let auto-prod run) and the phrasings "
+      +"that actually resume work will rank here."));
+  } else {
+    scored.forEach(r=>{
+      const bar=el("div","bar");
+      const top=el("div","top");
+      top.append(el("span","nudge",'"'+r.nudge+'"'),
+        el("span","pct",Math.round(r.rate*100)+"%"));
+      const track=el("div","track2");
+      const fill=el("div","fill");fill.style.width=Math.round(r.rate*100)+"%";
+      track.appendChild(fill);
+      const sub=el("div","sub");
+      sub.append(el("span","","n="+r.sent),
+        el("span","g","✓ "+r.productive+" worked"),
+        el("span","r","· "+r.restalled+" stuck"),
+        el("span","d","· "+r.dropped+" left"));
+      bar.append(top,track,sub);board.appendChild(bar);
+    });
+  }
+  const ev=$("#events");ev.textContent="";
+  const evs=d.events||[];
+  if(!evs.length){ev.appendChild(el("div","lab-empty","No prods yet."));}
+  evs.forEach(e=>{
+    const row=el("div","ev");
+    row.appendChild(el("span","oc "+(e.outcome||"")));
+    if(e.kind==="reassess"||e.kind==="custom")
+      row.appendChild(el("span","tag "+e.kind,e.kind));
+    const txt=el("div","txt");
+    txt.append(el("b","",e.project),
+      document.createTextNode('  "'+e.nudge+'"  ·  '+fmtAge(e.age)+" ago"
+        +(e.outcome?"  →  "+OUTCOME_LABEL[e.outcome]:"  · pending")));
+    row.appendChild(txt);
+    const up=el("button","vote"+(e.human===true?" on":""),"👍");
+    const dn=el("button","vote"+(e.human===false?" on":""),"👎");
+    up.onclick=()=>api({action:"feedback",id:e.id,good:true});
+    dn.onclick=()=>api({action:"feedback",id:e.id,good:false});
+    row.append(up,dn);
+    ev.appendChild(row);
+  });
+}
+function render(force){
+  if(!DATA||typingNow())return;
+  // never reshuffle rows under the pointer — a click must not land on a row
+  // that just re-sorted itself; the update runs when the mouse leaves
+  if(hoverList&&!force){pendingRender=true;return}
+  pendingRender=false;
+  const d=DATA;
+  const hosts=$("#hosts");hosts.textContent="";
+  Object.entries(d.hosts).forEach(([n,h])=>{
+    const p=el("span","pill");
+    const dot=el("span","dot "+(h.error?"err":h.scanning?"scan":h.ok?"ok":""));
+    p.append(dot,document.createTextNode(n));
+    if(h.error)p.title=h.error;
+    hosts.appendChild(p)});
+  const st=$("#stat");st.textContent="";
+  st.append(el("b","",String(d.agent_count)),
+    document.createTextNode(" agents"));
+  if(d.stalled_count){const s=el("span","stalled",
+    "  ·  "+d.stalled_count+" stalled");st.appendChild(s)}
+  $("#autoswitch").classList.toggle("on",d.auto_prod);
+  const t=$("#ticker");t.textContent=d.msgs.length?d.msgs[d.msgs.length-1]:"";
+  const lg=$("#log");lg.textContent="";
+  [...d.msgs].reverse().forEach(m=>lg.appendChild(el("div","",m)));
+  renderLab(d);
+  const list=$("#list");list.textContent="";
+  if(!d.rows.length){list.appendChild(el("div","empty","waiting for first scan…"));
+    return}
+  d.rows.forEach(row=>{
+    const key=row.host+"|"+row.path;
+    const card=el("div","card");
+    const main=el("div","rowmain");
+    const pn=el("div","pname");
+    pn.append(el("span","nm",row.name),el("span","host",row.host));
+    const mode=el("button","mode"+(row.mode==="PROD"?" prod":""),row.mode);
+    mode.title="click to switch between PROD (auto-nudge stalled agents) and leave";
+    mode.onclick=e=>{e.stopPropagation();
+      if(row.mode!=="PROD"&&!confirm("Set "+row.name+" to PROD? Stalled agents "
+        +"there get nudged automatically."))return;
+      api({action:"mode",host:row.host,path:row.path,
+           value:row.mode==="PROD"?"ignore":"auto"})};
+    const ag=el("div","agent");
+    if(row.agents.length){
+      const a=row.agents[0];const [cls,txt]=agentLabel(a);
+      ag.append(el("span","st "+cls[0]),el("span","txt",
+        txt+(row.agents.length>1?"  +"+(row.agents.length-1):"")));
+    }
+    const counts=el("div","counts");
+    ["15m","1h","24h","3d"].forEach(l=>{
+      counts.appendChild(el("div",l==="24h"?"big":"",String(row.counts[l]||0)))});
+    const lf=el("div","lastf");
+    lf.append(document.createTextNode(row.latest_file+" "),
+      el("span","","("+fmtAge(row.latest_age)+" ago)"));
+    main.append(pn,mode,ag,counts,spark(row.buckets),lf);
+    main.onclick=()=>{open.has(key)?open.delete(key):open.add(key);render(true)};
+    card.appendChild(main);
+    if(open.has(key))card.appendChild(detail(row,key));
+    list.appendChild(card);
+  });
+}
+$("#sortseg").onclick=e=>{const b=e.target.closest("button");if(!b)return;
+  SORT=b.dataset.s;
+  $("#sortseg").querySelectorAll("button").forEach(x=>
+    x.classList.toggle("on",x===b));
+  refresh()};
+$("#autoswitch").onclick=()=>api({action:"autoprod",value:!DATA.auto_prod});
+$("#logbtn").onclick=()=>$("#log").classList.toggle("show");
+$("#ticker").onclick=()=>$("#log").classList.toggle("show");
+$("#labbtn").onclick=()=>{$("#lab").classList.toggle("show");
+  $("#labbtn").classList.toggle("on");if(DATA)renderLab(DATA)};
+$("#quitbtn").onclick=()=>{if(confirm("Quit prodder? Scanning and auto-prodding "
+  +"stop."))api({action:"quit"})};
+const listEl=$("#list");
+listEl.addEventListener("mouseenter",()=>{hoverList=true});
+listEl.addEventListener("mouseleave",()=>{hoverList=false;
+  if(pendingRender)render()});
+// swing the carrot whenever a fresh prod lands in the message log
+let lastProdMsg="";
+function pulseOnProd(d){
+  const last=(d.msgs||[]).filter(m=>/prodded|approved prompt/.test(m)).pop()||"";
+  if(last&&last!==lastProdMsg){lastProdMsg=last;
+    const lg=$(".logo");lg.classList.remove("prodding");void lg.offsetWidth;
+    lg.classList.add("prodding")}
+}
+const _origRender=render;
+render=function(f){_origRender(f);if(DATA)pulseOnProd(DATA)};
+refresh();setInterval(()=>refresh(),2500);
+</script></body></html>
+"""
+
+
+def demo_config():
+    """A throwaway config for --demo: fast clock, no hosts, a temp state dir
+    so the demo never reads or writes your real prodder files."""
+    d = tempfile.mkdtemp(prefix="prodder-demo-")
+    toml = ("[settings]\n"
+            "[agents]\nidle_after = 8\nauto_prod = true\nprod_cooldown = 8\n"
+            "outcome_window = 14\nbandit_epsilon = 0.2\n"
+            "[remote]\nenabled = false\n"
+            "[web]\nport = 8737\n")
+    p = Path(d) / "demo.toml"
+    p.write_text(toml)
+    return load_config(str(p))
+
+
+def web(cfg, open_browser=True, demo=False):
+    """Serve the dashboard on localhost and run the engine behind it."""
+    eng = Engine(cfg, demo=demo)
+    eng.start()
+    agent_cfg = cfg["agents"]
+    port = cfg["web"]["port"]
+
+    def snapshot(sort_by):
+        projects, hosts, agents = gather_rows(
+            eng.state, eng.lock, sort_by, agent_cfg["idle_after"], eng.policies)
+        now = time.time()
+        rows = []
+        for p in projects:
+            path = row_path(p)
+            arows = []
+            for a in sorted(p.agents, key=lambda x: x.pid):
+                sent = eng.last_prod.get((a.host, a.pid), 0)
+                nxt = max(0, agent_cfg["prod_cooldown"] - (now - sent)) if sent else 0
+                arows.append({
+                    "name": a.name, "pid": a.pid, "host": a.host, "tty": a.tty,
+                    "idle": round(a.eff_idle(), 1), "cpu": round(a.work_cpu),
+                    "stalled": effective_stalled(a, agent_cfg["idle_after"]),
+                    "policy": a.policy, "protected": a.protected,
+                    "detached": a.detached, "web": a.web,
+                    "recognized": a.recognized,
+                    "where": (f"tmux {a.tmux}" if a.tmux else
+                              a.label if a.web else a.prod_tty or a.tty),
+                    "next_prod": round(nxt),
+                })
+            rows.append({
+                "name": p.name, "host": p.host, "path": path,
+                "mode": ("PROD" if match_policy(p.host, path, eng.policies)
+                         == "auto" else "leave"),
+                "nudge": match_policy(p.host, path, eng.nudges, None),
+                "counts": p.counts, "buckets": p.buckets or [0] * SPARK_BUCKETS,
+                "latest_file": trunc_path(p.latest_file, 44),
+                "latest_age": (round(now - p.latest_mtime)
+                               if p.latest_mtime else -1),
+                "recent": [[round(now - mt), rel] for mt, rel in p.recent[:10]],
+                "agents": arows,
+            })
+        stalled = sum(1 for a in agents if not a.web and a.policy != "ignore"
+                      and not a.protected
+                      and effective_stalled(a, agent_cfg["idle_after"]))
+        events = []
+        for e in eng.prodlog.recent_events(14):
+            events.append({"id": e["id"], "age": round(now - e["t"]),
+                           "project": e["project"], "host": e["host"],
+                           "nudge": e["nudge"], "kind": e["kind"],
+                           "auto": e["auto"], "outcome": e["outcome"],
+                           "human": e["human"]})
+        return {
+            "rows": rows,
+            "hosts": {n: {"ok": ok, "scanning": sc, "error": err,
+                          "age": round(now - ls) if ls else -1}
+                      for n, (ok, sc, err, ls) in hosts.items()},
+            "agent_count": len(agents), "stalled_count": stalled,
+            "auto_prod": agent_cfg["auto_prod"],
+            "msgs": list(eng.msgs), "default_nudge": agent_cfg["nudge"],
+            "leaderboard": eng.prodlog.leaderboard(),
+            "events": events,
+        }
+
+    def find_agent(host, tty):
+        with eng.lock:
+            for hs in eng.state.values():
+                for a in hs.agents:
+                    if a.host == host and a.tty == tty:
+                        apply_policies([a], eng.policies)
+                        return a
+        return None
+
+    KNOWN_ACTIONS = {"rescan", "autoprod", "mode", "nudge", "prod", "type",
+                     "close", "reopen", "feedback"}
+
+    def do_action(q):
+        act = q.get("action")
+        if act not in KNOWN_ACTIONS:
+            return "unknown action"
+        if act == "feedback":
+            ok = eng.prodlog.feedback(str(q.get("id", "")), bool(q.get("good")))
+            return "thanks — recorded" if ok else "prod not found"
+        if act == "rescan":
+            eng.wake.set()
+            return "rescanning"
+        if act == "autoprod":
+            agent_cfg["auto_prod"] = bool(q.get("value"))
+            return f"auto-prod {'on' if agent_cfg['auto_prod'] else 'off'}"
+        if act == "mode":
+            key = f"{q['host']}|{q['path']}"
+            if q.get("value") == "ignore":
+                eng.policies[key] = "ignore"
+                msg = "MODE = leave (never prodded)"
+            else:
+                eng.policies.pop(key, None)
+                if match_policy(q["host"], q["path"], eng.policies) != "auto":
+                    eng.policies[key] = "auto"
+                msg = "MODE = PROD (stalled agents here get prodded)"
+            save_state(cfg, eng.policies, eng.nudges)
+            return f"{os.path.basename(q['path'])}: {msg}"
+        if act == "nudge":
+            key = f"{q['host']}|{q['path']}"
+            txt = (q.get("text") or "").strip()
+            if txt:
+                eng.nudges[key] = txt
+                msg = f'nudge = "{txt[:50]}"'
+            else:
+                eng.nudges.pop(key, None)
+                msg = f"nudge reset to default '{agent_cfg['nudge']}'"
+            save_state(cfg, eng.policies, eng.nudges)
+            return f"{os.path.basename(q['path'])}: {msg}"
+        a = find_agent(q.get("host"), q.get("tty"))
+        if a is None:
+            return "agent is gone — rescan"
+        if eng.demo:                       # never touch the real system in a demo
+            return eng.driver.act(act, a)
+        if act == "prod":
+            msg = experiment_prod(a, cfg, eng.nudges, eng.prodlog)
+            if prod_succeeded(msg):
+                eng.last_prod[(a.host, a.pid)] = time.time()
+            return msg
+        if act == "type":
+            txt = (q.get("text") or "").strip()
+            if not txt:
+                return "nothing sent"
+            err = send_to_terminal(a, txt, submit=True)
+            eng.last_prod[(a.host, a.pid)] = time.time()
+            return err or f'sent "{txt[:40]}" to {a.name}'
+        if act == "close":
+            if a.protected:
+                return f"'{a.tmux}' is protected fleet infra — not closing"
+            msg = close_agent(a, cfg)
+            eng.drop_agent(a)
+            eng.wake.set()
+            return msg
+        if act == "reopen":
+            if a.protected:
+                return f"'{a.tmux}' is protected fleet infra — not touching"
+            if not a.detached:
+                return f"{a.name} still has a live terminal — prod or close it"
+            msg = reopen_agent(a, cfg)
+            eng.drop_agent(a)
+            eng.wake.set()
+            return msg
+        return "unknown action"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _host_ok(self):
+            # Reject any Host that isn't our own loopback name. A DNS-rebinding
+            # page (attacker.com -> 127.0.0.1) is same-origin to the browser,
+            # so its fetch may carry X-Prodder; the Host header still reads
+            # "attacker.com" and is refused here. Legit local access sends
+            # 127.0.0.1/localhost.
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            if host in ("127.0.0.1", "localhost", "::1", ""):
+                return True
+            self._send(403, "bad host", "text/plain")
+            return False
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if not self._host_ok():
+                return
+            url = urllib.parse.urlparse(self.path)
+            if url.path == "/":
+                self._send(200, WEB_PAGE, "text/html")
+            elif url.path == "/api/state":
+                sort_by = urllib.parse.parse_qs(url.query).get(
+                    "sort", ["recency"])[0]
+                try:
+                    self._send(200, json.dumps(snapshot(sort_by)))
+                except Exception as e:
+                    self._send(500, json.dumps({"error": str(e)[:200]}))
+            else:
+                self._send(404, "not found", "text/plain")
+
+        def do_POST(self):
+            if not self._host_ok():
+                return
+            if self.path != "/api/action":
+                return self._send(404, "not found", "text/plain")
+            # same-origin only: browsers can't add this header cross-site
+            # without a CORS preflight, which we never answer
+            if self.headers.get("X-Prodder") != "1":
+                return self._send(403, "forbidden", "text/plain")
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                q = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
+            except (ValueError, OSError):
+                return self._send(400, "bad request", "text/plain")
+            if q.get("action") == "quit":
+                self._send(200, json.dumps({"msg": "bye"}))
+                threading.Thread(target=srv.shutdown, daemon=True).start()
+                return
+            try:
+                msg = do_action(q)
+            except Exception as e:
+                msg = f"action failed: {str(e)[:120]}"
+            eng.msgs.append(f"[{time.strftime('%H:%M')}] {msg}")
+            self._send(200, json.dumps({"msg": msg}))
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}"
+    print(f"prodder dashboard: {url}", file=sys.stderr)
+    if open_browser:
+        threading.Timer(0.4, webbrowser.open, [url]).start()
+    try:
+        srv.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        eng.stop()
+        srv.server_close()
 
 
 def once(cfg):
@@ -1817,7 +3558,8 @@ def once(cfg):
                 agents = scan_agents_local(name, agent_cfg) + scan_web_tabs(agent_cfg)
             else:
                 entries, agents = scan_remote(name, hc["ssh"], hc["roots"],
-                                              settings["excludes"], window, agent_cfg)
+                                              settings["excludes"], window,
+                                              agent_cfg, mac=hc["os"] == "mac")
             all_projects += build_projects(name, hc["roots"], entries, window).values()
             all_agents += agents
         except Exception as e:
@@ -1833,7 +3575,7 @@ def once(cfg):
               f"  {sparkline(p.buckets)}  {trunc_path(p.latest_file, 50)}"
               f" ({fmt_age(now - p.latest_mtime)} ago)")
     if all_agents:
-        apply_policies(all_agents, load_policies(cfg))
+        apply_policies(all_agents, load_state(cfg)[0])
         print(f"\n{'AGENT':<8} {'HOST':<6} {'PID':<7} {'STATE':<8} {'POLICY':<8} "
               f"{'IDLE':<6} {'WHERE':<24} CWD")
         for a in sorted(all_agents, key=lambda x: (x.host, x.name)):
@@ -1847,36 +3589,74 @@ def once(cfg):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--config", default=str(Path(__file__).parent / "prodtop.toml"))
+    ap = argparse.ArgumentParser(prog="prodder", description=__doc__.splitlines()[0])
+    ap.add_argument("--version", action="version", version=f"prodder {__version__}")
+    # Config belongs to the project/working directory, not site-packages.
+    ap.add_argument("--config", default=str(Path.cwd() / "prodtop.toml"))
     ap.add_argument("--once", action="store_true",
                     help="print one snapshot as plain text and exit")
     ap.add_argument("--test-remote", action="store_true",
                     help="test the Telegram/WhatsApp connection and exit")
     ap.add_argument("--setup", action="store_true",
                     help="guided setup for phone answering (Telegram/WhatsApp)")
+    ap.add_argument("--tui", action="store_true",
+                    help="curses interface in this terminal instead of the "
+                         "web dashboard")
+    ap.add_argument("--port", type=int,
+                    help="dashboard port (default: [web] port, 8737)")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="serve the dashboard without opening a browser")
+    ap.add_argument("--demo", action="store_true",
+                    help="run a self-contained demo with a simulated fleet — "
+                         "no config, no ssh, nothing real is touched")
     args = ap.parse_args()
+    if args.demo:
+        cfg = demo_config()
+        if args.port:
+            cfg["web"]["port"] = args.port
+        print("prodder demo — a simulated fleet; nothing real is touched.",
+              file=sys.stderr)
+        web(cfg, open_browser=not args.no_browser, demo=True)
+        return
+    example_candidates = (
+        Path.cwd() / "prodtop.example.toml",
+        Path(__file__).parent / "prodtop.example.toml",
+        Path(sys.prefix) / "share" / "prodder" / "prodtop.example.toml",
+    )
+    example = next((p for p in example_candidates if p.exists()), None)
     if args.setup:
         if not os.path.exists(args.config):
-            example = Path(__file__).parent / "prodtop.example.toml"
-            if example.exists():
+            if example:
                 shutil.copy(example, args.config)
                 print(f"created {args.config} from the template")
+            else:
+                ap.error("no prodtop.example.toml found; provide --config")
         setup_wizard(load_config(args.config), args.config)
         return
     if not os.path.exists(args.config):
-        example = Path(__file__).parent / "prodtop.example.toml"
-        if example.exists():
-            print(f"{args.config} not found — using {example}; copy it to "
-                  f"prodtop.toml and edit your hosts", file=sys.stderr)
+        if example:
+            print(f"No prodtop.toml here yet.\n"
+                  f"  • Try it risk-free:   prodder --demo   "
+                  f"(a simulated fleet; nothing real is touched)\n"
+                  f"  • Set it up for real: cp {example.name} prodtop.toml   "
+                  f"(then edit its hosts/roots)\n"
+                  f"Starting from the bundled example for now — scanning "
+                  f"~/Projects, all remote hosts disabled.\n", file=sys.stderr)
             args.config = str(example)
+        else:
+            ap.error(f"{args.config} not found; create it, pass --config, "
+                     f"or try:  prodder --demo")
     cfg = load_config(args.config)
     if args.test_remote:
         test_remote(cfg)
     elif args.once:
         once(cfg)
-    else:
+    elif args.tui:
         tui(cfg)
+    else:
+        if args.port:
+            cfg["web"]["port"] = args.port
+        web(cfg, open_browser=not args.no_browser)
 
 
 def set_remote_config(path, values):

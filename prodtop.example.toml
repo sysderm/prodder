@@ -14,9 +14,37 @@ excludes = [
 
 [agents]
 # Coding-agent CLIs to look for in terminals (matched against process args).
-process_names = ["claude", "codex", "chatgpt", "aider", "gemini", "goose"]
+process_names = ["claude", "codex", "chatgpt", "aider", "gemini", "goose", "xcode", "antigravity", "cursor"]
 idle_after = 600       # no terminal output for this many seconds -> "stalled"
-nudge = "continue"     # what gets typed (+ Enter) into a prodded agent
+nudge = "continue"     # fallback nudge (used if nudge_pool is empty)
+
+# Also list every open Terminal.app/iTerm2 window on this Mac, not just the ones
+# running a recognised agent (process_names above) — so an agent whose process
+# prodder doesn't know about can't hide in a window it never showed. These extra
+# rows are shown but never auto-prodded; you can still Type… into them by hand.
+show_all_terminals = true
+
+# Nudge experiment. prodder rotates through nudge_pool with an epsilon-greedy
+# bandit — mostly sending whatever phrasing has best resumed real work, but
+# exploring the rest — and logs each prod's outcome (did the project produce
+# files afterward?) to prodder-events.jsonl / prodder-stats.json. The
+# dashboard's Nudge Lab (🥕) ranks them; 👍/👎 correct an outcome by hand. A
+# per-project custom nudge (set with 'n' in the TUI) always overrides the pool.
+nudge_pool = [
+  "continue",
+  "continue!",
+  "Please keep going with the current plan.",
+  "What's the next concrete step? Do it.",
+  "Proceed.",
+]
+bandit_epsilon = 0.15  # fraction of prods that explore a non-best phrasing
+outcome_window = 240   # seconds after a prod to judge whether it produced work
+
+# WRONG-DIRECTION GUARD. When a stalled screen looks finished or is handing a
+# decision back ("task complete", "let me know if…", "shall I…?"), a blunt
+# "continue!" makes the agent invent work. Instead prodder sends this reassess
+# nudge — an explicit off-ramp, so the agent re-checks rather than pushing on.
+reassess_nudge = "If the task is complete, briefly summarise what's done and what's left. If you're blocked or need a decision, say so. Otherwise continue."
 
 # CAUTION with the next two. auto_prod nudges every stalled agent without
 # asking — an agent waiting for YOUR input looks identical to a stalled one.
@@ -25,6 +53,9 @@ nudge = "continue"     # what gets typed (+ Enter) into a prodded agent
 auto_prod = false
 approve_prompts = false
 prod_cooldown = 900    # min seconds between prods of the same agent
+safe_stale_after = 20  # seconds of unchanged screen + low CPU before a nudge
+safe_stale_cpu = 1.0   # max aggregate terminal CPU (%) considered quiet
+auto_restart_attempts = 3 # recover after this many no-progress nudges
 
 # tmux session names (glob patterns) that are NEVER prodded, closed, or
 # reopened — for sessions managed by some other system.
@@ -67,16 +98,39 @@ whatsapp_apikey = ""
 imessage_handle = ""
 menu_idle = 90         # agent quiet this long with a menu on screen -> notify
 remote_timeout = 300   # hold auto-approve while waiting for your answer
+# If you've used the machine an agent runs on within this many seconds, skip
+# the phone ping — you're there and will see the prompt. Only applies to hosts
+# whose keyboard idle prodder can read (this Mac and remote Macs).
+notify_active_window = 300
 
+[web]
+port = 8737            # the dashboard listens on 127.0.0.1:<port> (never public)
+
+# Name each host however you like, but if you use Tailscale the node name is a
+# tidy convention (it already matches your ssh targets).
 [[hosts]]
 name = "local"
 local = true
 roots = ["~/Projects"]
 
 # Remote hosts are scanned over ssh (one find(1) round-trip per interval,
-# multiplexed connection). "ssh" is an alias from your ~/.ssh/config.
+# multiplexed connection). "ssh" is any target ssh(1) accepts: a ~/.ssh/config
+# alias, user@host, or a Tailscale MagicDNS name (e.g. "root@myvps" over
+# Tailscale SSH).
 [[hosts]]
 name = "server1"
 ssh = "server1"
 roots = ["/home/me/projects"]
+enabled = false
+
+# Remote Macs need os = "mac" (BSD scan script; no /proc). Agents in tmux are
+# prodded via tmux as usual; agents sitting in Terminal.app/iTerm2 windows are
+# prodded via osascript over ssh — grant the Automation consent once on that
+# Mac (a dialog appears on ITS screen the first time: sshd wants to control
+# Terminal/iTerm2). Sleeping laptops just show as offline.
+[[hosts]]
+name = "laptop2"
+ssh = "me@laptop2"
+os = "mac"
+roots = ["/Users/me/Projects"]
 enabled = false

@@ -1,7 +1,17 @@
 # personal/runtime files — never publish these
 prodtop.toml
 prodtop-state.json
+prodtop-state.json.bak
+prodder-events.jsonl
+prodder-stats.json
 closed-agents.md
 __pycache__/
 *.pyc
 .claude/
+
+# build artifacts (packaging + the compiled, arch-specific menu-bar binary;
+# ship the Swift source + Info.plist + .icns, rebuild the binary with build.sh)
+build/
+dist/
+*.egg-info/
+Prodder.app/Contents/MacOS/prodder

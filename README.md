@@ -1,6 +1,6 @@
-# prodtop
+# prodder
 
-**btop for your AI coding agents.** A terminal dashboard that watches which
+**btop for your AI coding agents.** Prodder is a terminal dashboard that watches which
 projects are actually producing files — locally and on remote hosts — finds
 the claude/codex/aider/gemini CLI sessions working on them, flags the ones
 that have silently stalled, and *prods them back to work* with a keystroke
@@ -24,7 +24,14 @@ where every agent is sitting idle waiting for nothing.
 - **Agent tracking**: finds coding-agent CLI processes, maps them to projects
   via their working directory, and measures idleness from real terminal
   output (tmux activity or tty mtime). `●` running · `⚠` stalled · `⊗`
-  detached (window gone) · `⊘`/`leave` marked leave-alone.
+  detached (window gone) · `⊘`/`leave` marked leave-alone · `▹` a plain
+  terminal window with no known agent.
+- **Nothing hides**: with `show_all_terminals` (default on), *every* open
+  Terminal.app/iTerm2 window on the local Mac is listed — not just the ones
+  running a recognised CLI — so an agent whose process prodder doesn't know
+  can't sit unseen in a window it never showed. These extra rows are display-
+  only: never auto-prodded and never counted as stalled, but you can still
+  **Type…** into one by hand.
 - **Prodding**: types your nudge (default `continue`) into the agent's
   terminal and *actually submits it* — text first, then a real carriage
   return after a pause, because TUI composers treat a text+newline burst as
@@ -65,13 +72,89 @@ Python 3.11+ stdlib only — no dependencies.
 ```sh
 git clone <repo> && cd prodtop
 cp prodtop.example.toml prodtop.toml   # edit roots/hosts
-./prodtop.py            # TUI
-./prodtop.py --once     # one plain-text snapshot
-./prodtop.py --setup    # guided phone-answering setup (Telegram/WhatsApp)
+python3 -m pip install .               # installs the `prodder` application
+prodder                                  # web dashboard (opens in your browser)
+prodder --tui                           # classic curses interface instead
+prodder --once                          # one plain-text snapshot
+prodder --setup                         # guided phone-answering setup (Telegram/WhatsApp)
 ```
 
-Keys: `j`/`k` select · `p` prod · `i` leave alone · `a` re-arm ·
-`x` close+save · `o` reopen detached · `s` sort · `r` rescan · `q` quit.
+The default interface is a dark, glassy web dashboard served on
+`127.0.0.1:8737` (`[web] port` in the config, `--port` to override,
+`--no-browser` to just serve). Everything the TUI does is a click: the
+PROD/leave pill toggles the policy, rows expand into recent files and
+per-agent Prod / Type / Nudge / Close / Reopen buttons, the header has the
+auto-prod switch, host health pills, sort, and the message log. Actions are
+same-origin-only and the server never listens beyond localhost.
+
+Homebrew Python refuses `pip install` into its own site-packages (PEP 668,
+"externally managed") — the install then silently never happens and `prodder`
+is not on PATH. Use `pipx install .` or
+`python3 -m pip install --break-system-packages .` there.
+
+### Remote hosts, including over Tailscale
+
+A host's `ssh` value is anything `ssh(1)` accepts — a `~/.ssh/config` alias,
+`user@host`, or a Tailscale MagicDNS name (`root@myvps` via Tailscale SSH,
+`me@somelaptop` via macOS Remote Login carried over the tailnet). Remote Macs
+additionally need `os = "mac"` in their host block: the scan then uses the BSD
+toolchain, and agents sitting in Terminal.app/iTerm2 windows (not tmux) are
+prodded by running the same AppleScript on that Mac over ssh. The first such
+prod/capture pops a one-time Automation consent dialog **on the remote Mac's
+own screen** ("sshd wants to control Terminal") — click Allow there once, or
+pre-enable it under System Settings → Privacy & Security → Automation.
+Until then, remote-Mac prods fail with a timeout error in the status line.
+Sleeping laptops simply show as offline (◌) and are retried each interval.
+
+For a checkout without installing, `./prodtop.py` remains supported. On macOS,
+double-click `Prodder.app`: it starts the engine headless (log:
+`~/Library/Logs/prodder.log`) and opens the dashboard — reuses the running
+server if there is one; the ⏻ button in the dashboard stops it. (Do not
+double-click `prodder.command`: Terminal runs a `.command` by *typing* its
+path into a fresh interactive shell, so anything in shell startup that drains
+pending tty input — e.g. an exec'd asciinema session recorder — silently
+discards the command and nothing launches. `./prodder.command` from an
+existing shell still works.)
+
+TUI keys (`--tui`): `j`/`k` select · `p` prod · `t` type · `n` nudge ·
+`i` leave alone · `a` re-arm · `x` close+save · `o` reopen detached ·
+`s` sort · `r` rescan · `q` quit.
+
+## Nudge experiment — which prods actually work
+
+Not every "continue!" helps, and a badly-timed one sends an agent off inventing
+work. prodder treats the nudge phrasing as an experiment:
+
+- **It rotates a pool of phrasings** (`nudge_pool`) with an epsilon-greedy
+  bandit — mostly sending whatever has best resumed real work, occasionally
+  exploring the rest. A per-project custom nudge (`n` in the TUI) overrides it.
+- **It scores each prod's outcome.** A few minutes later (`outcome_window`) it
+  checks whether the project produced files — the signal prodder already
+  tracks. Outcomes: *produced work* / *stayed stuck* / *agent left*. These land
+  in `prodder-events.jsonl` and aggregate into `prodder-stats.json`.
+- **The Nudge Lab** (🥕 in the dashboard header) ranks phrasings by the share of
+  prods that led to real output, with sample sizes. 👍/👎 on a recent prod
+  correct an outcome by hand — that also teaches the bandit.
+
+### Avoiding the wrong direction
+
+The main way a prod backfires is prodding an agent that is actually **finished
+or waiting for a decision** — a blunt "continue!" then makes it invent work.
+Three layers guard against it:
+
+1. **Numbered menus never get a nudge** — they're pushed to your phone for a
+   real decision (existing behavior).
+2. **Finished / hand-back screens get a reassess nudge, not a directive one.**
+   When the screen tail matches completion or question phrasing ("task
+   complete", "let me know if…", "shall I…?"), prodder sends `reassess_nudge`
+   — an explicit off-ramp ("if done, summarise; if blocked, say so; otherwise
+   continue") so the agent self-corrects instead of pushing forward.
+3. **The bandit learns to avoid harmful phrasings**, because a prod that leads
+   to *stayed stuck* / *agent left* counts against that nudge's score.
+
+Erring toward over-detecting "done" is deliberate: a false positive only sends
+the gentler reassess nudge (which still ends with "otherwise continue"); a
+false negative sends the harmful blunt one.
 
 ## Caveats, honestly
 
