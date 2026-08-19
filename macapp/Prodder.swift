@@ -194,12 +194,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }.resume()
     }
 
+    func apiKey() -> String {
+        // The engine writes its per-session token next to prodtop.py (0600).
+        let p = repoDir() + "/prodder-token"
+        return (try? String(contentsOfFile: p, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
     func post(_ obj: [String: Any]) {
         guard let u = URL(string: baseURL + "/api/action"),
               let body = try? JSONSerialization.data(withJSONObject: obj) else { return }
         var r = URLRequest(url: u)
         r.httpMethod = "POST"
         r.setValue("1", forHTTPHeaderField: "X-Prodder")
+        r.setValue(apiKey(), forHTTPHeaderField: "X-Prodder-Key")
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.httpBody = body
         URLSession.shared.dataTask(with: r).resume()

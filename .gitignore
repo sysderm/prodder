@@ -4,6 +4,7 @@ prodtop-state.json
 prodtop-state.json.bak
 prodder-events.jsonl
 prodder-stats.json
+prodder-token
 closed-agents.md
 __pycache__/
 *.pyc

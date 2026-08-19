@@ -29,6 +29,7 @@ import json
 import os
 import random
 import re
+import secrets
 import shlex
 import tempfile
 import shutil
@@ -3296,6 +3297,7 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
 <div id="log"></div>
 <script>
 "use strict";
+const KEY="__PRODDER_KEY__";   // per-session token, injected when this page is served
 let SORT="recency", DATA=null;
 const open=new Set(), forms={};   // key -> {kind:'type'|'nudge'}
 const $=(s,p)=>(p||document).querySelector(s);
@@ -3306,7 +3308,7 @@ function fmtAge(s){if(s==null||s<0)return"?";if(s<90)return Math.round(s)+"s";
   return Math.round(s/86400)+"d"}
 async function api(body){
   const r=await fetch("/api/action",{method:"POST",
-    headers:{"Content-Type":"application/json","X-Prodder":"1"},
+    headers:{"Content-Type":"application/json","X-Prodder":"1","X-Prodder-Key":KEY},
     body:JSON.stringify(body)});
   refresh(true); return r.ok}
 async function refresh(force){
@@ -3595,6 +3597,20 @@ def web(cfg, open_browser=True, demo=False):
     agent_cfg = cfg["agents"]
     port = cfg["web"]["port"]
 
+    # Per-session token gating state-changing actions. The X-Prodder header only
+    # stops cross-site browsers; it does nothing against another local process
+    # (or another user on a shared box) that can POST to /api/action and type
+    # into your agent terminals. The token is injected into the page we serve
+    # (so the browser has it transparently) and written 0600 for the native app
+    # / CLI to read. Read-only /api/state stays open (Host + cross-site guarded).
+    api_key = secrets.token_urlsafe(24)
+    key_path = Path(cfg.get("_dir", ".")) / "prodder-token"
+    try:
+        key_path.write_text(api_key)
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+
     def snapshot(sort_by):
         projects, hosts, agents = gather_rows(
             eng.state, eng.lock, sort_by, agent_cfg["idle_after"], eng.policies)
@@ -3764,7 +3780,8 @@ def web(cfg, open_browser=True, demo=False):
                 return
             url = urllib.parse.urlparse(self.path)
             if url.path == "/":
-                self._send(200, WEB_PAGE, "text/html")
+                self._send(200, WEB_PAGE.replace("__PRODDER_KEY__", api_key),
+                           "text/html")
             elif url.path == "/api/state":
                 sort_by = urllib.parse.parse_qs(url.query).get(
                     "sort", ["recency"])[0]
@@ -3783,6 +3800,11 @@ def web(cfg, open_browser=True, demo=False):
             # same-origin only: browsers can't add this header cross-site
             # without a CORS preflight, which we never answer
             if self.headers.get("X-Prodder") != "1":
+                return self._send(403, "forbidden", "text/plain")
+            # Per-session token: blocks other local processes/users that could
+            # otherwise POST actions (typing into your agent terminals).
+            if not secrets.compare_digest(
+                    self.headers.get("X-Prodder-Key", ""), api_key):
                 return self._send(403, "forbidden", "text/plain")
             try:
                 n = int(self.headers.get("Content-Length", 0))
