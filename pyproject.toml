@@ -40,7 +40,7 @@ prodder = "prodtop:main"
 prodtop = "prodtop:main"
 
 [tool.setuptools]
-py-modules = ["prodtop"]
+py-modules = ["prodtop", "prodtop_web"]
 
 [tool.setuptools.dynamic]
 version = { attr = "prodtop.__version__" }
