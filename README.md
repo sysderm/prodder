@@ -71,13 +71,21 @@ Python 3.11+ stdlib only — no dependencies.
 
 ```sh
 git clone <repo> && cd prodtop
-cp prodtop.example.toml prodtop.toml   # edit roots/hosts
-python3 -m pip install .               # installs the `prodder` application
+python3 prodtop.py --demo                # try it risk-free: a simulated fleet,
+                                         # no config, no ssh, nothing real touched
+
+pipx install .                           # install the `prodder` command (recommended)
+cp prodtop.example.toml prodtop.toml     # then edit roots/hosts
 prodder                                  # web dashboard (opens in your browser)
-prodder --tui                           # classic curses interface instead
-prodder --once                          # one plain-text snapshot
-prodder --setup                         # guided phone-answering setup (Telegram/WhatsApp)
+prodder --tui                            # classic curses interface instead
+prodder --once                           # one plain-text snapshot
+prodder --setup                          # guided phone-answering setup (Telegram/WhatsApp)
 ```
+
+`--demo` is the safe first step — it needs no config and works straight from a
+bare clone, so start there. `pipx` is recommended because most modern Pythons
+(Homebrew, Debian/Ubuntu, Arch) mark their site-packages "externally managed"
+(PEP 668) and refuse a plain `pip install` — see the note below.
 
 The default interface is a dark, glassy web dashboard served on
 `127.0.0.1:8737` (`[web] port` in the config, `--port` to override,
@@ -87,10 +95,13 @@ per-agent Prod / Type / Nudge / Close / Reopen buttons, the header has the
 auto-prod switch, host health pills, sort, and the message log. Actions are
 same-origin-only and the server never listens beyond localhost.
 
-Homebrew Python refuses `pip install` into its own site-packages (PEP 668,
-"externally managed") — the install then silently never happens and `prodder`
-is not on PATH. Use `pipx install .` or
-`python3 -m pip install --break-system-packages .` there.
+Most modern Python installs (Homebrew, Debian/Ubuntu, and Arch system Python)
+refuse `pip install` into their own site-packages (PEP 668, "externally
+managed") — the install then silently never happens and `prodder` is not on
+PATH. Prefer `pipx install .` (isolated, and it handles PATH), or, if you must
+use pip, `python3 -m pip install --break-system-packages .`. Needs Python 3.11+
+(for the stdlib `tomllib`); on an older interpreter `./prodtop.py` exits with a
+clear message telling you so.
 
 ### Remote hosts, including over Tailscale
 
@@ -119,6 +130,24 @@ existing shell still works.)
 TUI keys (`--tui`): `j`/`k` select · `p` prod · `t` type · `n` nudge ·
 `i` leave alone · `a` re-arm · `x` close+save · `o` reopen detached ·
 `s` sort · `r` rescan · `q` quit.
+
+### Running on a headless Linux box
+
+To run the engine itself on a server (agents in tmux, no GUI/browser on the
+host), start it without opening a browser and reach the localhost-only
+dashboard through an ssh tunnel:
+
+```sh
+# on the server (inside tmux/ssh):
+prodder --no-browser                     # or ./prodtop.py --no-browser
+# from your laptop:
+ssh -L 8737:127.0.0.1:8737 you@server    # then open http://127.0.0.1:8737
+```
+
+The dashboard never listens beyond loopback, so the tunnel (not a public bind)
+is how you reach it. `--tui` is the no-browser alternative for driving it
+directly in the terminal. Resolving each agent's project needs `lsof` **or**
+`/proc` — minimal images without `lsof` still work via `/proc`.
 
 ## Nudge experiment — which prods actually work
 
@@ -158,10 +187,16 @@ false negative sends the harmful blunt one.
 
 ## Caveats, honestly
 
-- **macOS-centric**: keystroke delivery targets Terminal.app/iTerm2 via
-  AppleScript (tmux paths work anywhere). Web prodding needs Chrome's
-  *View → Developer → Allow JavaScript from Apple Events* and uses
-  best-effort DOM selectors that chat sites may change at any time.
+- **macOS-centric for non-tmux agents.** Keystroke delivery and screen capture
+  target Terminal.app/iTerm2 via AppleScript, which exists only on macOS. The
+  **tmux path works anywhere** (local or over ssh). So on **Linux** the rule is
+  simple: run your agents inside **tmux** and everything works — prod, capture,
+  auto-prod; a non-tmux agent in gnome-terminal/xterm is still *listed* but
+  can't be prodded (there's no AppleScript to type into it). Web prodding needs
+  Chrome's *View → Developer → Allow JavaScript from Apple Events* and uses
+  best-effort DOM selectors that chat sites may change at any time. Native
+  **Windows** isn't supported; use **WSL2** (tmux + ssh work there) and run
+  `prodder --no-browser`, then open the dashboard in your Windows browser.
 - **A stalled agent and one awaiting your reply look identical.** With
   `auto_prod = true`, an agent politely asking a question gets "continue"
   typed at it after `idle_after` seconds. Defaults ship conservative
@@ -170,6 +205,23 @@ false negative sends the harmful blunt one.
   That is the point — and the risk. Use `protected` patterns and `leave`
   marks to fence off anything that shouldn't be touched.
 
+## Contributing
+
+Development is just Python + the stdlib — no build step for the engine.
+
+```sh
+python3 prodtop.py --demo    # run the dashboard against a simulated fleet
+python3 -m pytest            # run the tests (safety-critical decision logic)
+./build.sh                   # (macOS) rebuild the Prodder.app menu-bar binary
+```
+
+The whole engine is the single-file `prodtop.py`. The tests in `tests/` pin the
+behaviour that must never silently regress — which prompts are auto-approvable,
+which are refused by `never_approve`, and the "is this screen finished?"
+detection. Please keep them green (and add a case) when touching that logic.
+Issues and PRs welcome once the repository is public.
+
 ## License
 
 MIT
+

@@ -19,7 +19,10 @@ Keys:  j/k or arrows  select    s  toggle sort (recency / 24h count)
 """
 
 import argparse
-import curses
+try:
+    import curses                       # TUI only; absent on native Windows
+except ImportError:                     # pragma: no cover
+    curses = None
 import fnmatch
 import http.server
 import json
@@ -36,7 +39,13 @@ import sys
 import webbrowser
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:             # tomllib is stdlib only on 3.11+
+    sys.exit("prodder needs Python 3.11+ (for the stdlib 'tomllib' module); "
+             "you have Python %d.%d. Install a newer Python (e.g. `brew "
+             "install python@3.12`) and run it with that interpreter."
+             % sys.version_info[:2])
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -44,6 +53,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 __version__ = "0.1.0"
+
+IS_MAC = sys.platform == "darwin"
 
 SPARK_CHARS = " ▁▂▃▄▅▆▇█"
 SPARK_BUCKETS = 24          # 24 x 1h sparkline
@@ -59,12 +70,80 @@ SSH_BASE = [
     "-o", "StrictHostKeyChecking=accept-new",
 ]
 
-# Types text into a Terminal.app tab or iTerm2 session identified by its tty.
+# AppleScript app targeting, the hard-won way. iTerm2's *process* name is
+# "iTerm2" (used in the System Events `processes whose name` probes below), but
+# its *scripting* name is "iTerm" and it is only reachable by display-name
+# ("iTerm2") through a fragile Launch-Services alias that intermittently fails
+# to load the app's terminology — producing a COMPILE error (-2741,
+# "expected end of line but found identifier") on the `newline` keyword that
+# takes down the WHOLE script, including the unrelated Terminal.app branch.
+# So: always address iTerm by BUNDLE ID (immune to name-registration flakiness),
+# and for local sends/captures/listing run the Terminal.app and iTerm blocks as
+# SEPARATE osascript invocations (see mac_terminals()/run_local_osa) so a Mac
+# without iTerm — the default macOS box has only Terminal.app — never feeds iTerm
+# terminology to the compiler at all. The combined OSA_* below are used only for
+# the remote-Mac (osascript-over-ssh) path.
+ITERM = 'application id "com.googlecode.iterm2"'
+
+# Types text into a Terminal.app tab or iTerm session identified by its tty.
 # argv: tty, text, withCR ("1"/"0"). Any Enter is sent SEPARATELY after a
 # delay, and as a real carriage return (0x0D): TUI agents (claude/codex input
 # boxes) treat text+newline arriving in one burst as a paste, and a plain
 # newline is a line feed that composers map to "insert newline" — either way
 # the nudge would sit unsubmitted in the prompt.
+OSA_SEND_ITERM = '''
+on run argv
+  set theTTY to item 1 of argv
+  set theText to item 2 of argv
+  set withCR to item 3 of argv
+  tell ''' + ITERM + '''
+    repeat with w in windows
+      repeat with tb in tabs of w
+        repeat with s in sessions of tb
+          if (tty of s) is theTTY then
+            if theText is not "" then
+              tell s to write text theText newline no
+            end if
+            if withCR is "1" then
+              delay 0.6
+              tell s to write text (character id 13) newline no
+              delay 0.4
+              tell s to write text (character id 13) newline no
+            end if
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+'''
+
+OSA_SEND_TERM = '''
+on run argv
+  set theTTY to item 1 of argv
+  set theText to item 2 of argv
+  set withCR to item 3 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (tty of t) is theTTY then
+          do script theText in t
+          if withCR is "1" then
+            delay 0.6
+            do script "" in t
+          end if
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+'''
+
+# Combined send — remote-Mac (osascript-over-ssh) path only.
 OSA_SEND = '''
 on run argv
   set theTTY to item 1 of argv
@@ -75,19 +154,19 @@ on run argv
     set hasIterm to (count of (processes whose name is "iTerm2")) > 0
   end tell
   if hasIterm then
-    tell application "iTerm2"
+    tell ''' + ITERM + '''
       repeat with w in windows
         repeat with tb in tabs of w
           repeat with s in sessions of tb
             if (tty of s) is theTTY then
               if theText is not "" then
-                tell s to write text theText newline NO
+                tell s to write text theText newline no
               end if
               if withCR is "1" then
                 delay 0.6
-                tell s to write text (character id 13) newline NO
+                tell s to write text (character id 13) newline no
                 delay 0.4
-                tell s to write text (character id 13) newline NO
+                tell s to write text (character id 13) newline no
               end if
               return "ok"
             end if
@@ -116,8 +195,43 @@ on run argv
 end run
 '''
 
-# Returns the scrollback/screen of the Terminal.app tab or iTerm2 session
+# Returns the scrollback/screen of the Terminal.app tab or iTerm session
 # owning the given tty.
+OSA_CAPTURE_TERM = '''
+on run argv
+  set theTTY to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (tty of t) is theTTY then
+          return history of t
+        end if
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+'''
+
+OSA_CAPTURE_ITERM = '''
+on run argv
+  set theTTY to item 1 of argv
+  tell ''' + ITERM + '''
+    repeat with w in windows
+      repeat with tb in tabs of w
+        repeat with s in sessions of tb
+          if (tty of s) is theTTY then
+            return contents of s
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+'''
+
+# Combined capture — remote-Mac (osascript-over-ssh) path only.
 OSA_CAPTURE = '''
 on run argv
   set theTTY to item 1 of argv
@@ -137,7 +251,7 @@ on run argv
     end tell
   end if
   if hasIterm then
-    tell application "iTerm2"
+    tell ''' + ITERM + '''
       repeat with w in windows
         repeat with tb in tabs of w
           repeat with s in sessions of tb
@@ -153,37 +267,78 @@ on run argv
 end run
 '''
 
-# Returns comma-separated ttys of all Terminal.app tabs and iTerm2 sessions —
-# the authoritative "which ttys still have a window" list (process ancestry
-# lies: asciinema wrappers get reparented to launchd while their window lives).
-OSA_LIST_TTYS = '''
+# Comma-separated ttys of every live Terminal.app / iTerm tab — the
+# authoritative "which ttys still have a window" list (process ancestry lies:
+# asciinema wrappers get reparented to launchd while their window lives). Run
+# per-app locally and the results merged; see list_window_ttys().
+OSA_LIST_TERM = '''
 set out to ""
-tell application "System Events"
-  set hasTerm to (count of (processes whose name is "Terminal")) > 0
-  set hasIterm to (count of (processes whose name is "iTerm2")) > 0
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      set out to out & (tty of t) & ","
+    end repeat
+  end repeat
 end tell
-if hasTerm then
-  tell application "Terminal"
-    repeat with w in windows
-      repeat with t in tabs of w
-        set out to out & (tty of t) & ","
-      end repeat
-    end repeat
-  end tell
-end if
-if hasIterm then
-  tell application "iTerm2"
-    repeat with w in windows
-      repeat with tb in tabs of w
-        repeat with s in sessions of tb
-          set out to out & (tty of s) & ","
-        end repeat
-      end repeat
-    end repeat
-  end tell
-end if
 return out
 '''
+
+OSA_LIST_ITERM = '''
+set out to ""
+tell ''' + ITERM + '''
+  repeat with w in windows
+    repeat with tb in tabs of w
+      repeat with s in sessions of tb
+        set out to out & (tty of s) & ","
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out
+'''
+
+_MAC_TERMINALS = None
+
+
+def mac_terminals():
+    """(has_terminal, has_iterm): which terminal apps are INSTALLED on this Mac.
+    Probed by bundle-id lookup, which — unlike `tell application` — never loads
+    the app's scripting terminology, so it cannot raise the -2741 compile error
+    when an app is absent. This is what lets us keep iTerm terminology out of the
+    compiler entirely on a Terminal-only Mac. Cached: the answer is stable for a
+    run (and returns (False, False) off macOS, where osascript is missing)."""
+    global _MAC_TERMINALS
+    if _MAC_TERMINALS is None:
+        def installed(bid):
+            try:
+                r = subprocess.run(
+                    ["osascript", "-e", 'id of application id "%s"' % bid],
+                    capture_output=True, text=True, timeout=5)
+                return r.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                return False
+        _MAC_TERMINALS = (installed("com.apple.Terminal"),
+                          installed("com.googlecode.iterm2"))
+    return _MAC_TERMINALS
+
+
+def open_terminal_window(cmd):
+    """Open a new terminal window running `cmd` (iTerm preferred, Terminal.app
+    fallback). Returns True on success. Runs each app as a SEPARATE osascript so
+    a Mac without iTerm never compiles iTerm terminology (the -2741 bug)."""
+    has_term, has_iterm = mac_terminals()
+    for present, script in ((has_iterm, OSA_OPEN_ITERM),
+                            (has_term, OSA_OPEN_TERM)):
+        if not present:
+            continue
+        try:
+            r = subprocess.run(["osascript", "-", cmd], input=script,
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.stdout.strip() == "ok":
+            return True
+    return False
 
 # Lists Chrome tabs as "windowIdx <tab> tabIdx <tab> url <tab> title" lines.
 OSA_CHROME_LIST = '''
@@ -262,31 +417,35 @@ WEB_PROD_JS = '''
 })();
 '''
 
-# Opens a new terminal window and runs a shell command in it (iTerm2 first,
-# Terminal.app as fallback). Plain newline is fine here — the target is a
-# shell prompt, not a TUI composer.
-OSA_OPEN = '''
+# Opens a new terminal window and runs a shell command in it. iTerm preferred,
+# Terminal.app fallback — but as SEPARATE scripts (see open_terminal_window and
+# the -2741 note): a `try` does NOT catch an AppleScript *compile* error, so the
+# old single combined script died wholesale on a Mac where iTerm terminology
+# wouldn't resolve, taking the Terminal fallback down with it. Plain newline is
+# fine here — the target is a shell prompt, not a TUI composer.
+OSA_OPEN_ITERM = '''
 on run argv
   set theCmd to item 1 of argv
-  try
-    tell application "iTerm2"
-      activate
-      set w to (create window with default profile)
-      -- let the shell finish its init/MOTD first, or the typed command is
-      -- flushed away with the startup output
-      delay 3
-      tell current session of w to write text theCmd
-      return "ok"
-    end tell
-  end try
-  try
-    tell application "Terminal"
-      activate
-      do script theCmd
-      return "ok"
-    end tell
-  end try
-  return "fail"
+  tell ''' + ITERM + '''
+    activate
+    set w to (create window with default profile)
+    -- let the shell finish its init/MOTD first, or the typed command is
+    -- flushed away with the startup output
+    delay 3
+    tell current session of w to write text theCmd
+    return "ok"
+  end tell
+end run
+'''
+
+OSA_OPEN_TERM = '''
+on run argv
+  set theCmd to item 1 of argv
+  tell application "Terminal"
+    activate
+    do script theCmd
+    return "ok"
+  end tell
 end run
 '''
 
@@ -353,8 +512,13 @@ HORIZONS = [("15m", 900), ("1h", 3600), ("24h", 86400), ("3d", 259200)]
 
 
 def load_config(path):
-    with open(path, "rb") as f:
-        cfg = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"prodder: {path} is not valid TOML: {e}")
+    except OSError as e:
+        sys.exit(f"prodder: can't read config {path}: {e}")
     s = cfg.setdefault("settings", {})
     s.setdefault("window_days", 3)
     s.setdefault("local_interval", 45)
@@ -365,7 +529,8 @@ def load_config(path):
                                     "xcode", "antigravity", "cursor"])
     a.setdefault("idle_after", 600)
     a.setdefault("nudge", "continue")
-    a.setdefault("approve_prompts", True)
+    a.setdefault("approve_prompts", False)   # fail safe: never auto-approve
+                                             # command prompts unless opted in
     a.setdefault("web_prod", True)
     a.setdefault("web_sites", {"claude.ai": "claude-web",
                                "chatgpt.com": "chatgpt-web",
@@ -596,7 +761,16 @@ def list_local_tmux_panes():
         return {}
 
 
-TERMINAL_APPS_RX = re.compile(r"iTerm|Terminal|Ghostty|kitty|[Aa]lacritty|wezterm")
+# Process comms that mean "this pid's terminal window is a real, live GUI
+# terminal" (used to tell an attached agent from a detached/window-gone one).
+# Includes the common Linux terminals so a live gnome-terminal/konsole/xterm
+# agent isn't mislabeled "detached" (and then destroyed by a Reopen) on hosts
+# where AppleScript window enumeration doesn't exist. Short/ambiguous comms
+# (e.g. "st") are deliberately omitted to avoid matching unrelated processes.
+TERMINAL_APPS_RX = re.compile(
+    r"iTerm|Terminal|Ghostty|kitty|[Aa]lacritty|wezterm|"
+    r"gnome-terminal|konsole|xterm|urxvt|tilix|xfce4-terminal|terminator|"
+    r"sakura|foot|ptyxis|contour")
 
 
 def outer_tty(pid, procs):
@@ -619,15 +793,27 @@ def outer_tty(pid, procs):
 
 
 def list_window_ttys():
-    """Set of ttys owned by a live Terminal/iTerm tab, or None if unknown."""
-    try:
-        r = subprocess.run(["osascript", "-e", OSA_LIST_TTYS],
-                           capture_output=True, text=True, timeout=15)
+    """Set of ttys owned by a live Terminal/iTerm tab, or None if unknown.
+    Terminal.app and iTerm are queried as SEPARATE scripts (see the -2741 note)
+    so a Mac with only one of them still gets a definitive answer instead of a
+    whole-script compile failure."""
+    has_term, has_iterm = mac_terminals()
+    if not (has_term or has_iterm):
+        return None
+    ttys, any_ok = set(), False
+    for present, script in ((has_term, OSA_LIST_TERM),
+                            (has_iterm, OSA_LIST_ITERM)):
+        if not present:
+            continue
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            continue
         if r.returncode == 0:
-            return {t.strip() for t in r.stdout.split(",") if t.strip()}
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return None
+            any_ok = True
+            ttys |= {t.strip() for t in r.stdout.split(",") if t.strip()}
+    return ttys if any_ok else None
 
 
 def scan_web_tabs(agent_cfg):
@@ -701,12 +887,22 @@ def close_web_tab(agent, cfg):
     return f"closed {agent.name} tab — URL saved → closed-agents.md"
 
 
+def pfloat(s):
+    """float() that tolerates a comma decimal separator — ps/stat output on a
+    de_DE/fr_FR-style locale prints "0,4"; the LC_ALL=C we set should prevent
+    that, but this is the belt to that suspenders (raises ValueError like float)."""
+    return float(s.replace(",", ".", 1) if "," in s else s)
+
+
 def scan_agents_local(host_name, agent_cfg):
     now = time.time()
     rx = agent_regex(agent_cfg["process_names"])
     try:
+        # LC_ALL=C so pcpu prints a dot decimal — a comma-decimal locale
+        # (de_DE, fr_FR, …) makes float() throw and every agent vanish.
         out = subprocess.run(["ps", "-axo", "pid=,ppid=,tty=,pcpu=,args="],
-                             capture_output=True, text=True, timeout=15)
+                             capture_output=True, text=True, timeout=15,
+                             env={**os.environ, "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         return []
     rows, procs, tty_cpu = [], {}, {}
@@ -721,7 +917,7 @@ def scan_agents_local(host_name, agent_cfg):
             continue
         if tty not in ("??", "?", "-"):
             try:
-                tty_cpu["/dev/" + tty] = tty_cpu.get("/dev/" + tty, 0.0) + float(cpu)
+                tty_cpu["/dev/" + tty] = tty_cpu.get("/dev/" + tty, 0.0) + pfloat(cpu)
             except ValueError:
                 pass
         if tty in ("??", "?", "-") or "prodtop" in args:
@@ -730,7 +926,7 @@ def scan_agents_local(host_name, agent_cfg):
         if not m:
             continue
         try:
-            rows.append((int(pid), "/dev/" + tty, float(cpu), m.group(1)))
+            rows.append((int(pid), "/dev/" + tty, pfloat(cpu), m.group(1)))
         except ValueError:
             pass
     cwds = lsof_cwds([p for p, _, _, _ in rows])
@@ -746,7 +942,11 @@ def scan_agents_local(host_name, agent_cfg):
         if window_ttys is not None:
             a.detached = a.prod_tty not in window_ttys
         else:
-            a.detached = not attached
+            # No window list (no osascript). The "is there a GUI terminal-app
+            # in the ancestry" heuristic is macOS-only — on Linux a live agent
+            # in gnome-terminal/konsole/xterm has no such ancestor, so only
+            # trust it on macOS; elsewhere a present tty means attached.
+            a.detached = IS_MAC and not attached
         pane = panes.get(tty)
         if pane:
             a.pane, a.tmux, a.sock = pane["pane"], pane["session"], pane["sock"]
@@ -831,6 +1031,14 @@ def lsof_cwds(pids):
                 cwds[cur] = ln[1:]
     except (OSError, subprocess.SubprocessError):
         pass
+    # Linux fallback for pids lsof missed (or lsof absent entirely, common on
+    # minimal servers/containers): read /proc/<pid>/cwd. No-op on macOS.
+    for p in pids:
+        if p not in cwds:
+            try:
+                cwds[p] = os.readlink(f"/proc/{p}/cwd")
+            except OSError:
+                pass
     return cwds
 
 
@@ -840,7 +1048,9 @@ def remote_command(roots, excludes, days):
     find_part = (f"find {roots_q} \\( {prune} \\) -prune -o "
                  f"-type f -mtime -{days} -printf '%T@\\t%p\\n' 2>/dev/null")
     return (
-        find_part + "; "
+        # C locale so ps pcpu / stat mtimes are dot-decimal, not "0,4"
+        "export LC_ALL=C; "
+        + find_part + "; "
         "echo ===AGENTS===; ps -eo pid=,tty=,pcpu=,args=; "
         "echo ===TMUX===; for s in /tmp/tmux-*/default; do "
         'tmux -S "$s" list-panes -a -F '
@@ -862,6 +1072,8 @@ def remote_command_mac(roots, excludes, days):
     prune = " -o ".join(f"-name {shlex.quote(x)}" for x in excludes)
     roots_q = " ".join(shlex.quote(r) for r in roots)
     return (
+        # C locale so ps pcpu / stat mtimes are dot-decimal, not "0,4"
+        "export LC_ALL=C; "
         f"find {roots_q} \\( {prune} \\) -prune -o "
         f"-type f -mtime -{days} -print0 2>/dev/null | "
         "xargs -0 stat -f '%m%t%N' 2>/dev/null; "
@@ -952,7 +1164,7 @@ def scan_remote(host_name, ssh_target, roots, excludes, window, agent_cfg,
             continue
         try:
             dev = "/dev/" + parts[1]
-            tty_cpu[dev] = tty_cpu.get(dev, 0.0) + float(parts[2])
+            tty_cpu[dev] = tty_cpu.get(dev, 0.0) + pfloat(parts[2])
         except ValueError:
             pass
     for line in sections["AGENTS"]:
@@ -969,7 +1181,7 @@ def scan_remote(host_name, ssh_target, roots, excludes, window, agent_cfg,
         try:
             a = AgentProc(host=host_name, ssh=ssh_target, pid=int(pid),
                           name=m.group(1), cwd=cwds.get(pid, ""), tty=dev,
-                          cpu=float(cpu), work_cpu=tty_cpu.get(dev, float(cpu)),
+                          cpu=pfloat(cpu), work_cpu=tty_cpu.get(dev, pfloat(cpu)),
                           scanned_at=now, mac=mac)
         except ValueError:
             continue
@@ -1120,32 +1332,54 @@ def send_to_terminal(agent, text, submit=True):
             if r is not None and r.returncode != 0:
                 return f"send failed: {r.stderr.strip()[:80]}"
             return None
+        if not agent.ssh and sys.platform != "darwin":
+            # No tmux pane and not macOS: there is no way to type into a bare
+            # terminal window here. Say so plainly instead of failing later with
+            # a cryptic "[Errno 2] ... 'osascript'".
+            return ("typing into a bare terminal is macOS-only — run this agent "
+                    "inside tmux so prodder can send keys via tmux send-keys")
         if not agent.ssh or agent.mac:
             tty = agent.prod_tty or agent.tty
             osa_args = [tty, text, "1" if submit and text != "\x1b" else "0"]
             if agent.ssh:
-                # Remote Mac: same AppleScript, executed on that Mac. Needs a
-                # one-time Automation consent for sshd on the remote machine.
+                # Remote Mac: one combined AppleScript, executed on that Mac.
+                # Needs a one-time Automation consent for sshd on the remote box.
                 cmd = "osascript - " + " ".join(shlex.quote(x) for x in osa_args)
                 r = subprocess.run(SSH_BASE + [agent.ssh, cmd], input=OSA_SEND,
                                    capture_output=True, text=True, timeout=45)
+                res, err = r.stdout.strip(), r.stderr.strip()
             else:
-                r = subprocess.run(["osascript", "-"] + osa_args,
-                                   input=OSA_SEND, capture_output=True, text=True,
-                                   timeout=30)
-            res = r.stdout.strip()
+                # Local: run Terminal.app and iTerm as SEPARATE osascripts so a
+                # Mac without iTerm never compiles iTerm terminology (the -2741
+                # bug); one app's failure can't abort the other's delivery.
+                has_term, has_iterm = mac_terminals()
+                if not (has_term or has_iterm):
+                    return "no scriptable terminal (Terminal.app / iTerm) found"
+                res, err = "notfound", ""
+                for present, script in ((has_term, OSA_SEND_TERM),
+                                        (has_iterm, OSA_SEND_ITERM)):
+                    if not present:
+                        continue
+                    r = subprocess.run(["osascript", "-"] + osa_args, input=script,
+                                       capture_output=True, text=True, timeout=30)
+                    res = r.stdout.strip()
+                    if res == "ok":
+                        err = ""
+                        break
+                    if r.returncode != 0 and r.stderr.strip():
+                        err = r.stderr.strip()
             if res == "ok":
                 return None
-            if res == "notfound":
+            if res == "notfound" and not err:
                 return (f"no terminal tab owns {tty} — session is detached "
                         f"(closed window?) or in an unscriptable terminal")
-            return f"send failed: {(r.stderr or res).strip()[:80]}"
+            return f"send failed: {(err or res)[:100]}"
         return f"can't reach {agent.name} on {agent.host}: not in tmux"
     except (OSError, subprocess.SubprocessError) as e:
         return f"send failed: {e}"
 
 
-def prod_agent(agent, nudge, approve_prompts=True, never_approve=(), screen=None):
+def prod_agent(agent, nudge, approve_prompts=False, never_approve=(), screen=None):
     """Unstick an agent: if it is sitting on an approval prompt, press Enter
     to accept the default "Yes"; otherwise type the nudge text + Enter.
     Prompts matching a never_approve pattern are left for a human. Pass
@@ -1613,11 +1847,20 @@ def capture_screen(agent):
             r = subprocess.run(SSH_BASE + [agent.ssh, cmd], input=OSA_CAPTURE,
                                capture_output=True, text=True, timeout=40)
             return r.stdout
-        if not agent.ssh:
-            r = subprocess.run(["osascript", "-", agent.prod_tty or agent.tty],
-                               input=OSA_CAPTURE, capture_output=True, text=True,
-                               timeout=25)
-            return r.stdout
+        if not agent.ssh and sys.platform == "darwin":
+            # Local: Terminal.app and iTerm captured as SEPARATE scripts so a
+            # Mac without iTerm never compiles iTerm terminology (the -2741 bug).
+            tty = agent.prod_tty or agent.tty
+            has_term, has_iterm = mac_terminals()
+            for present, script in ((has_term, OSA_CAPTURE_TERM),
+                                    (has_iterm, OSA_CAPTURE_ITERM)):
+                if not present:
+                    continue
+                r = subprocess.run(["osascript", "-", tty], input=script,
+                                   capture_output=True, text=True, timeout=25)
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout
+            return ""
     except (OSError, subprocess.SubprocessError):
         pass
     return ""
@@ -1779,26 +2022,40 @@ def reopen_agent(agent, cfg):
         return f"no resume path known for {agent.name} — closing only"
     msg = close_agent(agent, cfg)
     time.sleep(0.5)
-    try:
-        r = subprocess.run(["osascript", "-", cmd], input=OSA_OPEN,
-                           capture_output=True, text=True, timeout=30)
-        opened = r.stdout.strip() == "ok"
-    except (OSError, subprocess.SubprocessError):
-        opened = False
+    opened = open_terminal_window(cmd)
     return msg + ("; reopened in a new terminal window" if opened
                   else "; could NOT open a new terminal — resume cmd is in the log")
 
 
+# The cd path deliberately excludes every shell metacharacter — this string is
+# handed to `do script` / `write text`, i.e. executed in a shell, and the screen
+# it is scraped from is UNTRUSTED (it is whatever the AI agent printed, which can
+# be steered by a malicious repo file or prompt-injected content). A permissive
+# path segment here is a remote-code-execution hole. See resume_from_screen.
 RESUME_ON_SCREEN_RX = re.compile(
-    r"(?:cd\s+[^\n;&]+\s*&&\s*)?"
-    r"(?:codex\s+resume(?:\s+(?:--last|[\w-]+))?|"
-    r"claude\s+--resume\s+[^\s`]+)", re.I)
+    r"(?:cd\s+[A-Za-z0-9_./~-]+\s*&&\s*)?"
+    r"(?:codex\s+resume(?:\s+(?:--last|[A-Za-z0-9._-]+))?|"
+    r"claude\s+--resume\s+[A-Za-z0-9._-]+)", re.I)
+
+# Belt-and-braces: even after the tightened regex, refuse to execute anything
+# carrying shell metacharacters. Nothing in a legitimate resume command needs
+# them, so their presence means the match is not what we think it is.
+_SHELL_META_RX = re.compile(r"[;&|`$(){}<>\n\r\\\"']")
 
 
 def resume_from_screen(screen):
-    """A CLI's Ctrl-C output may include the exact resume command to reuse."""
-    matches = RESUME_ON_SCREEN_RX.findall(screen)
-    return matches[-1].strip() if matches else ""
+    """A CLI's Ctrl-C output may include the exact resume command to reuse.
+    Returns it ONLY if it is metacharacter-free (the screen is untrusted and the
+    result is executed in a shell); otherwise "" so the caller falls back to the
+    trusted session store."""
+    for m in reversed(RESUME_ON_SCREEN_RX.findall(screen)):
+        cmd = m.strip()
+        # `&&` is the one allowed connector (cd <path> && <cli>); strip it before
+        # the metacharacter check so a stray single `&`, `|`, `$(…)`, backtick,
+        # etc. is still rejected.
+        if cmd and not _SHELL_META_RX.search(cmd.replace("&&", "")):
+            return cmd
+    return ""
 
 
 def recover_agent(agent, cfg):
@@ -1809,20 +2066,17 @@ def recover_agent(agent, cfg):
     if err:
         return f"recovery Ctrl-C failed: {err}"
     time.sleep(2)
-    cmd = resume_from_screen(capture_screen(agent))
-    if not cmd:
-        resume = find_resume(agent)
-        cmd = resume[0] if resume else ""
+    # Prefer the CLI's own session store (find_resume: shlex-quoted, trusted)
+    # over anything scraped off the screen. resume_from_screen is only a
+    # metacharacter-free fallback — the screen is untrusted and `cmd` is run in
+    # a shell.
+    resume = find_resume(agent)
+    cmd = resume[0] if resume else resume_from_screen(capture_screen(agent))
     if not cmd:
         return "recovery stopped agent but found no resume command"
-    try:
-        r = subprocess.run(["osascript", "-", cmd], input=OSA_OPEN,
-                           capture_output=True, text=True, timeout=30)
-        if r.stdout.strip() == "ok":
-            return f"recovered {agent.name} with `{cmd}`"
-        return f"recovery restart failed: {(r.stderr or r.stdout).strip()[:80]}"
-    except (OSError, subprocess.SubprocessError) as e:
-        return f"recovery restart failed: {e}"
+    if open_terminal_window(cmd):
+        return f"recovered {agent.name} with `{cmd}`"
+    return "recovery restart failed: could not open a new terminal window"
 
 
 # ---------------------------------------------------------------- display
@@ -2051,8 +2305,7 @@ def draw(scr, state, lock, sel, sel_key, sort_by, agent_cfg, ui_msg, policies,
             mode = ("PROD" if match_policy(p.host, row_path(p), policies) == "auto"
                     else "leave")
         line = (f" {p.name:<{name_w}.{name_w}} {p.host:<{host_w}} {mode:<{mode_w}}"
-                f" {agent_cell(p, idle_after, last_prod,
-                               agent_cfg['prod_cooldown']):<{agent_w}.{agent_w}}"
+                f" {agent_cell(p, idle_after, last_prod, agent_cfg['prod_cooldown']):<{agent_w}.{agent_w}}"
                 + "".join(f"{p.counts.get(lbl, 0):>{cnt_w}}" for lbl, _ in HORIZONS)
                 + f"  {sparkline(p.buckets)}  "
                 + f"{trunc_path(p.latest_file, 40)}"
@@ -2659,6 +2912,10 @@ class Engine:
 
 
 def tui(cfg):
+    if curses is None:
+        sys.exit("--tui needs the 'curses' module, which isn't available on "
+                 "this platform (native Windows). Use the web dashboard "
+                 "instead: run prodder with no flags, or `prodder --demo`.")
     eng = Engine(cfg)
     eng.start()
     state, lock, wake = eng.state, eng.lock, eng.wake
@@ -2795,6 +3052,8 @@ def tui(cfg):
 
     try:
         curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass          # quit-by-Ctrl-C should exit cleanly, not dump a traceback
     finally:
         eng.stop()
 
@@ -3531,7 +3790,12 @@ def web(cfg, open_browser=True, demo=False):
             eng.msgs.append(f"[{time.strftime('%H:%M')}] {msg}")
             self._send(200, json.dumps({"msg": msg}))
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        eng.stop()
+        sys.exit(f"prodder: can't bind 127.0.0.1:{port} ({e}). Is prodder "
+                 f"already running? Pick another with --port <n>.")
     url = f"http://127.0.0.1:{port}"
     print(f"prodder dashboard: {url}", file=sys.stderr)
     if open_browser:
@@ -3638,7 +3902,7 @@ def main():
             print(f"No prodtop.toml here yet.\n"
                   f"  • Try it risk-free:   prodder --demo   "
                   f"(a simulated fleet; nothing real is touched)\n"
-                  f"  • Set it up for real: cp {example.name} prodtop.toml   "
+                  f"  • Set it up for real: cp {example} prodtop.toml   "
                   f"(then edit its hosts/roots)\n"
                   f"Starting from the bundled example for now — scanning "
                   f"~/Projects, all remote hosts disabled.\n", file=sys.stderr)
@@ -3685,6 +3949,12 @@ def set_remote_config(path, values):
                 seg = seg.replace("[remote]", f"[remote]\n{k} = {fmt(v)}", 1)
         text = text[:start] + seg + text[end:]
     Path(path).write_text(text)
+    # This file now holds a Telegram bot token (a keystroke-injection
+    # credential) — keep it readable only by its owner.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def setup_wizard(cfg, config_path):

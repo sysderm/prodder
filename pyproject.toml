@@ -1,15 +1,39 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]           # >=77 for the SPDX `license` string form
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "prodder"
-version = "0.1.0"
+dynamic = ["version"]                    # single-sourced from prodtop.__version__
 description = "A safe activity monitor and prodding service for coding agents"
 readme = "README.md"
-requires-python = ">=3.11"
-license = { file = "LICENSE" }
-dependencies = []
+requires-python = ">=3.11"               # needs the stdlib tomllib module
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Alexander Navarini" }]
+keywords = ["cli", "tui", "monitoring", "ai-agents", "claude", "codex", "tmux"]
+dependencies = []                        # stdlib only
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Environment :: Console :: Curses",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Monitoring",
+  "Topic :: Utilities",
+]
+
+# Fill in the real repository once it is public.
+[project.urls]
+Homepage = "https://github.com/OWNER/prodder"
+Repository = "https://github.com/OWNER/prodder"
+Issues = "https://github.com/OWNER/prodder/issues"
 
 [project.scripts]
 prodder = "prodtop:main"
@@ -17,6 +41,9 @@ prodtop = "prodtop:main"
 
 [tool.setuptools]
 py-modules = ["prodtop"]
+
+[tool.setuptools.dynamic]
+version = { attr = "prodtop.__version__" }
 
 [tool.setuptools.data-files]
 "share/prodder" = ["prodtop.example.toml"]

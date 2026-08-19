@@ -7,6 +7,7 @@ prodder-stats.json
 closed-agents.md
 __pycache__/
 *.pyc
+.pytest_cache/
 .claude/
 
 # build artifacts (packaging + the compiled, arch-specific menu-bar binary;

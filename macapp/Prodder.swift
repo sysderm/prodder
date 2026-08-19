@@ -32,7 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Bundle.main.bundleURL.deletingLastPathComponent().path
     }
 
-    func pickPython() -> String {
+    func pickPython() -> String? {
         for c in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3",
                   "/usr/bin/python3"] where FileManager.default.isExecutableFile(atPath: c) {
             let p = Process()
@@ -42,7 +42,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? p.run(); p.waitUntilExit()
             if p.terminationStatus == 0 { return c }
         }
-        return "/usr/bin/python3"
+        return nil    // no Python 3.11+ with tomllib — caller must surface this,
+                      // NOT silently launch a stock 3.9 that dies on `import tomllib`
+    }
+
+    func logFileURL() -> URL {
+        let logs = FileManager.default.urls(for: .libraryDirectory,
+                                            in: .userDomainMask)[0]
+            .appendingPathComponent("Logs")
+        try? FileManager.default.createDirectory(at: logs,
+                                                 withIntermediateDirectories: true)
+        return logs.appendingPathComponent("prodder.log")
+    }
+
+    func openLog() -> FileHandle? {
+        let url = logFileURL()
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        let h = try? FileHandle(forWritingTo: url)
+        _ = try? h?.seekToEnd()          // append, don't truncate
+        return h
     }
 
     func serverAlreadyUp() -> Bool {
@@ -57,19 +77,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startServer() {
+        guard let python = pickPython() else {
+            alert("Prodder needs Python 3.11+ (with the stdlib \"tomllib\").\n" +
+                  "Install a newer Python — e.g.  brew install python  — then " +
+                  "reopen Prodder.")
+            return
+        }
         let proc = Process()
         proc.currentDirectoryURL = URL(fileURLWithPath: repoDir())
-        proc.executableURL = URL(fileURLWithPath: pickPython())
+        proc.executableURL = URL(fileURLWithPath: python)
         proc.arguments = ["prodtop.py", "--no-browser"]
+        let log = openLog()          // tee the engine's output to ~/Library/Logs/prodder.log
         let pipe = Pipe()
         proc.standardError = pipe
         proc.standardOutput = pipe
         pipe.fileHandleForReading.readabilityHandler = { fh in
-            let s = String(data: fh.availableData, encoding: .utf8) ?? ""
+            let data = fh.availableData
+            log?.write(data)
+            let s = String(data: data, encoding: .utf8) ?? ""
             if let r = s.range(of: "http://127.0.0.1:[0-9]+",
                                options: .regularExpression) {
                 let url = String(s[r])
                 DispatchQueue.main.async { self.serverReady(url) }
+            }
+        }
+        // If the engine exits before we ever saw a URL, it failed to start —
+        // surface the tail of the log instead of opening a dead dashboard.
+        proc.terminationHandler = { p in
+            try? log?.close()
+            if !self.opened && p.terminationStatus != 0 {
+                let tail = (try? String(contentsOf: self.logFileURL(),
+                                        encoding: .utf8))?.suffix(500) ?? ""
+                DispatchQueue.main.async {
+                    self.alert("The prodder server stopped before it was ready.\n" +
+                               "See ~/Library/Logs/prodder.log\n\n\(tail)")
+                }
             }
         }
         do {
@@ -79,7 +121,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert("Couldn't start the prodder server.\n\(error.localizedDescription)")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            if self.timer == nil { self.serverReady(self.baseURL) }   // fallback
+            if self.timer == nil && self.server?.isRunning == true {
+                self.serverReady(self.baseURL)   // fallback: assume default port
+            }
         }
     }
 
