@@ -1308,10 +1308,10 @@ def send_to_terminal(agent, text, submit=True):
     """Deliver text (and optionally a submitting Enter) to the agent's
     terminal. text of "\\x1b" sends a bare Escape. Returns None on success,
     an error string otherwise."""
-    # Central guard: protected fleet sessions (cockpit-*, vps-batch, agentd,
-    # …; see ~/CLAUDE.md) are hands-off for EVERY caller — prod, manual type,
-    # recovery. prod_agent also checks earlier, but keystrokes must never
-    # reach a protected pane by any path.
+    # Central guard: sessions matching a `protected` glob (see the [agents]
+    # config) are hands-off for EVERY caller — prod, manual type, recovery.
+    # prod_agent also checks earlier, but keystrokes must never reach a
+    # protected pane by any path.
     if agent.protected:
         return f"'{agent.tmux}' is a protected session — not typing into it"
     try:
