@@ -590,7 +590,17 @@ def load_config(path):
     w = cfg.setdefault("web", {})
     w.setdefault("port", 8737)
     cfg["hosts"] = [h for h in cfg.get("hosts", []) if h.get("enabled", True)]
-    for h in cfg["hosts"]:
+    for i, h in enumerate(cfg["hosts"]):
+        # Validate up front with a friendly message, instead of a KeyError
+        # traceback at Engine start (missing name) or a cryptic per-scan
+        # "scan failed: 'ssh'" much later (remote host missing ssh).
+        if not h.get("name"):
+            sys.exit(f"prodder: host #{i + 1} in {path} needs a \"name\" "
+                     f"(e.g. name = \"local\").")
+        if not h.get("local") and not h.get("ssh"):
+            sys.exit(f"prodder: host \"{h['name']}\" is not local, so it needs an "
+                     f"\"ssh\" target (e.g. ssh = \"user@host\"), or set "
+                     f"local = true.")
         h["roots"] = [os.path.expanduser(r) for r in h.get("roots", [])]
         h.setdefault("os", "linux")   # remote hosts: "linux" | "mac"
     cfg["_dir"] = str(Path(path).resolve().parent)
