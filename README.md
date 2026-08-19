@@ -204,6 +204,19 @@ false negative sends the harmful blunt one.
 - **`approve_prompts = true` approves whatever command the agent proposed.**
   That is the point — and the risk. Use `protected` patterns and `leave`
   marks to fence off anything that shouldn't be touched.
+- **Prodding costs money and you own the bill.** Every nudge makes a paid coding
+  agent keep working — more API tokens, more time, possibly more commands run.
+  With `auto_prod = true` prodder will re-nudge on its own; a stuck loop plus a
+  misjudged "stalled" screen can burn tokens while you're away. `prod_cooldown`
+  (default 900s) and `auto_restart_attempts` bound how often that happens, but
+  they don't cap spend. **Set hard spending limits with your model provider**,
+  start with the conservative defaults, and turn on `auto_prod` only once you
+  trust it in your setup. prodder issues no requests to any AI provider itself —
+  it types into agents you already run — so all usage and cost is yours.
+- **Local-trust tool.** The dashboard listens only on `127.0.0.1` and gates
+  every action behind a per-session token (`prodder-token`, written `0600`), but
+  it assumes the local machine and its users are trusted. Don't run it on a host
+  where you wouldn't hand another logged-in user a keyboard to your agents.
 
 ## Contributing
 
@@ -219,9 +232,18 @@ The whole engine is the single-file `prodtop.py`. The tests in `tests/` pin the
 behaviour that must never silently regress — which prompts are auto-approvable,
 which are refused by `never_approve`, and the "is this screen finished?"
 detection. Please keep them green (and add a case) when touching that logic.
-Issues and PRs welcome once the repository is public.
+Issues and PRs welcome.
+
+## Disclaimer
+
+prodder automates keystrokes into AI coding agents that can run commands and
+incur usage costs. It is provided **as is, without warranty of any kind**, and
+its authors are **not liable** for any resulting cost, data loss, or damage (see
+the full terms in `LICENSE`). You are solely responsible for what your agents do
+when prodded and for any charges they incur — use the conservative defaults, set
+provider spending limits, and enable automation only where you accept the risk.
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
 

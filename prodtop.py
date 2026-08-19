@@ -3104,8 +3104,17 @@ def web(cfg, open_browser=True, demo=False):
     api_key = secrets.token_urlsafe(24)
     key_path = Path(cfg.get("_dir", ".")) / "prodder-token"
     try:
-        key_path.write_text(api_key)
-        os.chmod(key_path, 0o600)
+        # Create 0600 atomically — a write_text()+chmod sequence leaves a window
+        # where the token is world-readable (umask 0644) to other local users,
+        # and O_TRUNC alone would keep a stale file's loose perms. Unlink, then
+        # O_EXCL create guarantees a fresh owner-only file.
+        try:
+            os.unlink(str(key_path))
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(api_key)
     except OSError:
         pass
 
@@ -3259,7 +3268,10 @@ def web(cfg, open_browser=True, demo=False):
             # "attacker.com" and is refused here. Legit local access sends
             # 127.0.0.1/localhost.
             host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
-            if host in ("127.0.0.1", "localhost", "::1", ""):
+            # Require an explicit loopback Host. HTTP/1.1 mandates a Host header,
+            # so a legit browser always sends one; accepting "" gave non-browser
+            # clients a needless free pass.
+            if host in ("127.0.0.1", "localhost", "::1"):
                 return True
             self._send(403, "bad host", "text/plain")
             return False
@@ -3301,8 +3313,12 @@ def web(cfg, open_browser=True, demo=False):
                 return self._send(403, "forbidden", "text/plain")
             # Per-session token: blocks other local processes/users that could
             # otherwise POST actions (typing into your agent terminals).
+            # Compare as bytes: compare_digest rejects non-ASCII str with a
+            # TypeError, which a crafted header could otherwise use to force a
+            # 500 instead of a clean 403.
             if not secrets.compare_digest(
-                    self.headers.get("X-Prodder-Key", ""), api_key):
+                    self.headers.get("X-Prodder-Key", "").encode("utf-8", "ignore"),
+                    api_key.encode()):
                 return self._send(403, "forbidden", "text/plain")
             try:
                 n = int(self.headers.get("Content-Length", 0))
