@@ -8,7 +8,7 @@ dynamic = ["version"]                    # single-sourced from prodtop.__version
 description = "A safe activity monitor and prodding service for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"               # needs the stdlib tomllib module
-license = "MIT"
+license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Alexander Navarini" }]
 keywords = ["cli", "tui", "monitoring", "ai-agents", "claude", "codex", "tmux"]
@@ -29,11 +29,10 @@ classifiers = [
   "Topic :: Utilities",
 ]
 
-# Fill in the real repository once it is public.
 [project.urls]
-Homepage = "https://github.com/OWNER/prodder"
-Repository = "https://github.com/OWNER/prodder"
-Issues = "https://github.com/OWNER/prodder/issues"
+Homepage = "https://github.com/sysderm/prodder"
+Repository = "https://github.com/sysderm/prodder"
+Issues = "https://github.com/sysderm/prodder/issues"
 
 [project.scripts]
 prodder = "prodtop:main"

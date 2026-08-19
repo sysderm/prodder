@@ -245,5 +245,15 @@ provider spending limits, and enable automation only where you accept the risk.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+Copyright © 2026 Alexander Navarini.
+
+prodder is licensed under the **GNU Affero General Public License v3.0 or later**
+(AGPL-3.0-or-later) — see [`LICENSE`](LICENSE). In short: you may use, modify,
+and share it freely, but if you run a modified version — including as a network
+service — you must make your source available under the same license.
+
+**Commercial licensing:** if the AGPL's copyleft/source-sharing terms don't fit
+your use (for example, embedding prodder in a closed-source or hosted commercial
+product), a separate commercial license is available from the author. Open an
+issue or get in touch.
 

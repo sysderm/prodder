@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Alexander Navarini
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """The dashboard front-end (HTML + CSS + JS), served by web() in
 prodtop.py. Kept in its own module so the ~500-line page is editable
 without scrolling past it in the main file; __PRODDER_KEY__ is replaced

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Alexander Navarini
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# This program is free software under the GNU AGPL v3+ (see LICENSE). A separate
+# commercial license is available from the author.
 """prodder — btop-style activity monitor for file-producing projects.
 
 Watches project folders on this Mac and on remote hosts (via ssh) and shows
