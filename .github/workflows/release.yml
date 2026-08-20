@@ -1,0 +1,29 @@
+name: Publish to PyPI
+
+# Publishes to PyPI via Trusted Publishing (OIDC) whenever you publish a GitHub
+# Release — no API token stored anywhere. One-time setup on PyPI:
+#   pypi.org -> your project (or "pending publisher" before the first upload)
+#   -> Publishing -> add a GitHub publisher:
+#        owner: sysderm   repo: prodder   workflow: release.yml   environment: pypi
+# Then bump prodtop.__version__, tag, and publish a GitHub Release for that tag.
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi            # matches the PyPI publisher's environment name
+    permissions:
+      id-token: write            # mint the OIDC token PyPI trusts; no secrets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
