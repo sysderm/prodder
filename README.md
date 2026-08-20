@@ -1,11 +1,25 @@
-# prodder
+# 🥕 prodder
 
-**btop for your AI coding agents.** Prodder is a terminal dashboard that watches which
-projects are actually producing files — locally and on remote hosts — finds
-the claude/codex/aider/gemini CLI sessions working on them, flags the ones
-that have silently stalled, and *prods them back to work* with a keystroke
-(or automatically). Born from the plague of coming back to six terminals
-where every agent is sitting idle waiting for nothing.
+### btop for your AI coding agents — see which ones stalled, and nudge them back to work.
+
+[![PyPI](https://img.shields.io/pypi/v/prodder)](https://pypi.org/project/prodder/)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](pyproject.toml)
+[![CI](https://github.com/sysderm/prodder/actions/workflows/ci.yml/badge.svg)](https://github.com/sysderm/prodder/actions/workflows/ci.yml)
+
+Prodder is a terminal + web dashboard that watches which projects are actually
+producing files — locally and on remote hosts — finds the claude/codex/aider/gemini
+CLI sessions working on them, flags the ones that have silently stalled, and
+*prods them back to work* with a keystroke (or automatically). Born from the plague
+of coming back to six terminals where every agent is sitting idle waiting for nothing.
+
+> **Try it in 10 seconds, nothing real touched:**
+> `pipx install prodder && prodder --demo`
+
+<!-- Demo GIF: record a ~15s capture of `prodder --demo`, save as docs/demo.gif,
+     and uncomment the next line for an animated hero shot at the top of the page. -->
+<!-- ![prodder dashboard](docs/demo.gif) -->
 
 ```
  prodtop  local ● server1 ●   agents: 13 (4 stalled)              14:03:22
