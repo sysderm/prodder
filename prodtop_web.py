@@ -90,6 +90,12 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
 .rowmain{display:grid;grid-template-columns:minmax(180px,1.2fr) 74px minmax(150px,1fr)
   200px 130px minmax(140px,1fr);gap:14px;align-items:center;padding:12px 16px;
   cursor:pointer}
+.listhead{display:grid;grid-template-columns:minmax(180px,1.2fr) 74px minmax(150px,1fr)
+  200px 130px minmax(140px,1fr);gap:14px;align-items:center;padding:4px 17px 0;
+  font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--ink3)}
+.listhead .counts{font-size:10px;color:var(--ink3)}
+.listhead .counts .big{color:var(--ink2);font-weight:600}
+.listhead .rt{text-align:right}
 .pname{font-weight:600;display:flex;align-items:center;gap:9px;min-width:0}
 .pname .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .host{font-size:11px;color:var(--ink3);border:1px solid var(--line);
@@ -211,7 +217,7 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
 .queue-empty{font-size:12px;color:var(--ink3);padding:6px 0}
 @media(max-width:820px){.queues{grid-template-columns:1fr}.task-form{grid-template-columns:1fr}.task-form button{width:max-content}}
 @media(max-width:900px){.rowmain{grid-template-columns:1fr 70px 1fr;row-gap:6px}
-  .counts,.spark,.lastf{display:none}}
+  .counts,.spark,.lastf,.listhead{display:none}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;
   transition:none!important;scroll-behavior:auto!important}}
 </style></head><body>
@@ -260,6 +266,16 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
         <div id="events"></div>
       </div>
     </div>
+  </div>
+  <div class="listhead" aria-hidden="true">
+    <div>project</div><div>mode</div><div>agent</div>
+    <div class="counts">
+      <div title="files written in the last 15 minutes">15m</div>
+      <div title="files written in the last hour">1h</div>
+      <div class="big" title="files written in the last 24 hours">24h</div>
+      <div title="files written in the last 3 days">3d</div>
+    </div>
+    <div>activity 24h</div><div class="rt">recent file</div>
   </div>
   <div id="list"><div class="empty">waiting for first scan…</div></div>
 </main>
@@ -564,8 +580,10 @@ function render(force){
         txt+(row.agents.length>1?"  +"+(row.agents.length-1):"")));
     }
     const counts=el("div","counts");
+    const CH={"15m":"last 15 minutes","1h":"last hour","24h":"last 24 hours","3d":"last 3 days"};
     ["15m","1h","24h","3d"].forEach(l=>{
-      counts.appendChild(el("div",l==="24h"?"big":"",String(row.counts[l]||0)))});
+      const c=el("div",l==="24h"?"big":"",String(row.counts[l]||0));
+      c.title="files written in the "+CH[l];counts.appendChild(c)});
     const lf=el("div","lastf");
     lf.append(document.createTextNode(row.latest_file+" "),
       el("span","","("+fmtAge(row.latest_age)+" ago)"));

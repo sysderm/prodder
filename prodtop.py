@@ -65,7 +65,7 @@ try:                                    # Prodder supports POSIX hosts only.
 except ImportError:                     # pragma: no cover - defensive only
     fcntl = None
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 IS_MAC = sys.platform == "darwin"
 

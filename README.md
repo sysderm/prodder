@@ -74,11 +74,14 @@ where every agent is sitting idle waiting for nothing.
 Python 3.11+ stdlib only — no dependencies.
 
 ```sh
-git clone <repo> && cd prodtop
+# Fastest: install + risk-free demo in one line (no clone, no config)
+pipx install git+https://github.com/sysderm/prodder && prodder --demo
+
+# Or from a clone (also lets you edit the code):
+git clone https://github.com/sysderm/prodder && cd prodder
 python3 prodtop.py --demo                # try it risk-free: a simulated fleet,
                                          # no config, no ssh, nothing real touched
-
-pipx install .                           # install the `prodder` command (recommended)
+pipx install .                           # install the `prodder` command from the clone
 cp prodtop.example.toml prodtop.toml     # then edit roots/hosts
 prodder                                  # web dashboard (opens in your browser)
 prodder --tui                            # classic curses interface instead
