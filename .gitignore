@@ -5,6 +5,10 @@ prodtop-state.json.bak
 prodder-events.jsonl
 prodder-stats.json
 prodder-token
+prodder.lock
+prodder-workspace.sqlite3
+prodder-workspace.sqlite3-shm
+prodder-workspace.sqlite3-wal
 closed-agents.md
 __pycache__/
 *.pyc

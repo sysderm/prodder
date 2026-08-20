@@ -54,6 +54,10 @@ where every agent is sitting idle waiting for nothing.
 - **Per-project modes**: the MODE column shows `PROD` vs `leave`; toggle
   with `i`/`a`. Policies are keyed by project path and survive restarts,
   reopened sessions, and new agents in the same project.
+- **Workbench**: create a task with acceptance criteria, move it through
+  *Working* → *Needs you* → *Ready to review*, and attach provider-neutral
+  lifecycle events. Verify records Git evidence and can run only explicitly
+  configured test/lint commands.
 - **Answer from your phone**: when a quiet agent has a "1/2/3" decision menu
   on screen, prodtop sends the menu to **Telegram** with answer buttons —
   tap `1`, `2`, `esc`, or reply with free text, and it is typed into that
@@ -80,6 +84,8 @@ prodder                                  # web dashboard (opens in your browser)
 prodder --tui                            # classic curses interface instead
 prodder --once                           # one plain-text snapshot
 prodder --setup                          # guided phone-answering setup (Telegram/WhatsApp)
+prodder --emit-event PlanProposed --task-id <task-id> \
+  --event-source codex-hook --event-payload '{"steps": 3}'
 ```
 
 `--demo` is the safe first step — it needs no config and works straight from a
@@ -93,7 +99,11 @@ The default interface is a dark, glassy web dashboard served on
 PROD/leave pill toggles the policy, rows expand into recent files and
 per-agent Prod / Type / Nudge / Close / Reopen buttons, the header has the
 auto-prod switch, host health pills, sort, and the message log. Actions are
-same-origin-only and the server never listens beyond localhost.
+same-origin-only and the server never listens beyond localhost. Every terminal
+action is bound to the agent PID and scanned session identity as well as its tty,
+so an old browser click is refused rather than reaching a reused terminal. The
+dashboard cannot be embedded by another site (anti-clickjacking headers), and
+only one engine may run for a configuration directory at a time.
 
 Most modern Python installs (Homebrew, Debian/Ubuntu, and Arch system Python)
 refuse `pip install` into their own site-packages (PEP 668, "externally
@@ -149,6 +159,33 @@ is how you reach it. `--tui` is the no-browser alternative for driving it
 directly in the terminal. Resolving each agent's project needs `lsof` **or**
 `/proc` — minimal images without `lsof` still work via `/proc`.
 
+### Workbench: verified agent work, not just activity
+
+The workbench is local-first state stored in `prodder-workspace.sqlite3`
+(owner-only). Create a task from the dashboard, write the acceptance criteria
+that make it genuinely done, then use **Ready to review** and **Verify** before
+marking it done. Verify always captures Git branch, diff, and dirty/clean
+evidence. It never guesses a repository's test command; configure vetted checks
+under `[workbench]` first:
+
+```toml
+[workbench]
+check_commands = ["pytest -q", "npm run lint", "npm test"]
+check_timeout = 300
+```
+
+Commands run without a shell, only from a task within a configured local root,
+and only when you press Verify. Remote projects can still carry tasks and
+provider events, but verification remains a deliberate local action for now.
+
+Provider adapters, hooks, or CI bridges can record standard events through the
+authenticated local `POST /api/events` endpoint or the `--emit-event` command:
+`TaskDefined`, `PlanProposed`, `ToolStarted`, `ApprovalNeeded`, `FileChanged`,
+`CheckPassed`, `PreviewReady`, `AgentBlocked`, `AgentCompleted`, `CommitCreated`,
+`PullRequestOpened`, `CIPassed`, `DeployReady`, `Deployed`, and `Rollback`.
+This is the stable integration seam; terminal-screen detection remains the
+fallback for tools that cannot emit structured events.
+
 ## Nudge experiment — which prods actually work
 
 Not every "continue!" helps, and a badly-timed one sends an agent off inventing
@@ -158,8 +195,9 @@ work. prodder treats the nudge phrasing as an experiment:
   bandit — mostly sending whatever has best resumed real work, occasionally
   exploring the rest. A per-project custom nudge (`n` in the TUI) overrides it.
 - **It scores each prod's outcome.** A few minutes later (`outcome_window`) it
-  checks whether the project produced files — the signal prodder already
-  tracks. Outcomes: *produced work* / *stayed stuck* / *agent left*. These land
+  checks whether the project produced files — a deliberately narrow activity
+  signal, **not proof of correct or useful code**. Outcomes: *file activity* /
+  *stayed stuck* / *agent left*. These land
   in `prodder-events.jsonl` and aggregate into `prodder-stats.json`.
 - **The Nudge Lab** (🥕 in the dashboard header) ranks phrasings by the share of
   prods that led to real output, with sample sizes. 👍/👎 on a recent prod
@@ -217,6 +255,10 @@ false negative sends the harmful blunt one.
   every action behind a per-session token (`prodder-token`, written `0600`), but
   it assumes the local machine and its users are trusted. Don't run it on a host
   where you wouldn't hand another logged-in user a keyboard to your agents.
+- **History is sensitive.** `closed-agents.md`, nudge events, policies, and
+  dashboard tokens are written owner-only. Terminal tails are redacted for
+  common credential patterns before a close is logged; configure
+  `history_redact_patterns` for any internal token formats you use.
 
 ## Contributing
 
@@ -256,4 +298,3 @@ service — you must make your source available under the same license.
 your use (for example, embedding prodder in a closed-source or hosted commercial
 product), a separate commercial license is available from the author. Open an
 issue or get in touch.
-

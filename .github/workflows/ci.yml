@@ -17,12 +17,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test deps
+      - name: Install test runner
         run: python -m pip install --upgrade pip pytest
       - name: Byte-compile
         run: python -m py_compile prodtop.py
       - name: Run tests
         run: python -m pytest -q
+        # Most tests are stdlib unittest.TestCase (runnable with `python -m
+        # unittest discover -s tests` and no deps); a few use pytest features,
+        # so CI uses pytest, which runs both styles.
 
   build:
     runs-on: ubuntu-latest

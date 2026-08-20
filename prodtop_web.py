@@ -60,7 +60,7 @@ header{
   font:inherit;font-size:12px;cursor:pointer}
 .seg button.on{background:var(--card-hi);color:var(--ink)}
 .switch{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink2);
-  cursor:pointer;user-select:none}
+  cursor:pointer;user-select:none;border:0;background:transparent;font:inherit}
 .track{width:34px;height:20px;border-radius:99px;background:var(--card-hi);
   border:1px solid var(--line);position:relative;transition:.18s}
 .track::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;
@@ -71,6 +71,9 @@ header{
 .iconbtn{background:transparent;border:1px solid var(--line);border-radius:9px;
   color:var(--ink2);width:30px;height:30px;cursor:pointer;font-size:14px}
 .iconbtn:hover{color:var(--ink);background:var(--card)}
+button:focus-visible,[role="button"]:focus-visible,input:focus-visible{
+  outline:2px solid var(--accent2);outline-offset:2px
+}
 #ticker{padding:6px 22px;font-size:12px;color:var(--ink2);cursor:pointer;
   border-bottom:1px solid rgba(255,255,255,.04);white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis}
@@ -143,6 +146,12 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
 #log.show{display:block}
 #log div{padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}
 .empty{color:var(--ink3);text-align:center;padding:60px 0;font-size:13px}
+#notice{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:30;
+  max-width:min(680px,calc(100vw - 32px));padding:9px 13px;border-radius:9px;
+  background:rgba(14,18,24,.96);border:1px solid var(--line);color:var(--ink);
+  box-shadow:0 10px 28px rgba(0,0,0,.35);opacity:0;pointer-events:none;
+  transition:opacity .16s}
+#notice.show{opacity:1} #notice.error{border-color:rgba(229,72,77,.65);color:#ffd6d8}
 /* Nudge Lab */
 #lab{display:none;margin:0 0 4px}
 #lab.show{display:block}
@@ -185,8 +194,26 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
 .vote:hover{opacity:1}
 .vote.on{opacity:1;filter:drop-shadow(0 0 4px rgba(240,134,45,.6))}
 .lab-empty{color:var(--ink3);font-size:12px;padding:8px 0}
+.workbench{padding:16px;display:flex;flex-direction:column;gap:14px}
+.workbench-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.workbench-head h2{font-size:16px;letter-spacing:.1px}.workbench-head p{color:var(--ink2);font-size:12px;flex:1}
+.task-form{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:start}
+.task-form textarea{grid-column:1/-1;min-height:54px;resize:vertical;font:inherit;font-size:13px;color:var(--ink);
+  background:rgba(0,0,0,.3);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+.task-form select{font:inherit;font-size:13px;color:var(--ink);background:rgba(0,0,0,.3);
+  border:1px solid var(--line);border-radius:8px;padding:7px 10px;min-width:0}
+.queues{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.queue{border:1px solid var(--line);border-radius:10px;padding:10px;min-height:110px;background:rgba(0,0,0,.13)}
+.queue h3{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--ink2);margin-bottom:8px}
+.task{padding:9px 0;border-top:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column;gap:6px}
+.task:first-of-type{border-top:0}.task-title{font-size:13px;font-weight:650}.task-meta{font-size:11px;color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-criteria{font-size:11px;color:var(--ink2);padding-left:16px}.task-actions{display:flex;gap:6px;flex-wrap:wrap}
+.queue-empty{font-size:12px;color:var(--ink3);padding:6px 0}
+@media(max-width:820px){.queues{grid-template-columns:1fr}.task-form{grid-template-columns:1fr}.task-form button{width:max-content}}
 @media(max-width:900px){.rowmain{grid-template-columns:1fr 70px 1fr;row-gap:6px}
   .counts,.spark,.lastf{display:none}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;
+  transition:none!important;scroll-behavior:auto!important}}
 </style></head><body>
 <header>
   <div class="logo">
@@ -206,15 +233,22 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
     <button data-s="recency" class="on">Recent</button>
     <button data-s="24h">24h</button>
   </div>
-  <label class="switch" id="autoswitch" title="auto-prod stalled agents">
-    auto-prod <span class="track"></span>
-  </label>
-  <button class="iconbtn" id="labbtn" title="nudge lab — which prods work">🥕</button>
-  <button class="iconbtn" id="logbtn" title="message log">≡</button>
-  <button class="iconbtn" id="quitbtn" title="quit prodder">⏻</button>
+  <button class="switch" id="autoswitch" type="button" role="switch" aria-checked="false"
+    aria-label="Toggle automatic nudging of stalled agents">auto-prod <span class="track"></span></button>
+  <button class="iconbtn" id="labbtn" type="button" aria-label="Open nudge effectiveness lab">🥕</button>
+  <button class="iconbtn" id="logbtn" type="button" aria-label="Open message log">≡</button>
+  <button class="iconbtn" id="quitbtn" type="button" aria-label="Quit Prodder">⏻</button>
 </header>
 <div id="ticker"></div>
 <main>
+  <section class="panel workbench" id="workbench" aria-labelledby="workbench-title">
+    <div class="workbench-head">
+      <div><h2 id="workbench-title">Build with intent</h2><p>Define what good looks like, then verify before you ship.</p></div>
+      <button class="btn hot" id="newtask" type="button">New task</button>
+    </div>
+    <div id="taskform"></div>
+    <div class="queues" id="taskqueues"></div>
+  </section>
   <div id="lab">
     <div class="lab-grid">
       <div class="panel">
@@ -230,6 +264,7 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
   <div id="list"><div class="empty">waiting for first scan…</div></div>
 </main>
 <div id="log"></div>
+<div id="notice" role="status" aria-live="polite"></div>
 <script>
 "use strict";
 const KEY="__PRODDER_KEY__";   // per-session token, injected when this page is served
@@ -242,10 +277,21 @@ function fmtAge(s){if(s==null||s<0)return"?";if(s<90)return Math.round(s)+"s";
   if(s<5400)return Math.round(s/60)+"m";if(s<129600)return Math.round(s/3600)+"h";
   return Math.round(s/86400)+"d"}
 async function api(body){
-  const r=await fetch("/api/action",{method:"POST",
-    headers:{"Content-Type":"application/json","X-Prodder":"1","X-Prodder-Key":KEY},
-    body:JSON.stringify(body)});
-  refresh(true); return r.ok}
+  try{
+    const r=await fetch("/api/action",{method:"POST",
+      headers:{"Content-Type":"application/json","X-Prodder":"1","X-Prodder-Key":KEY},
+      body:JSON.stringify(body)});
+    const data=await r.json().catch(()=>({msg:"unexpected server response"}));
+    notice(data.msg||("request failed ("+r.status+")"),!r.ok);refresh(true);return r.ok
+  }catch(e){notice("server unreachable",true);return false}
+}
+let noticeTimer;
+function notice(msg,error){const n=$("#notice");n.textContent=msg;
+  n.classList.toggle("error",!!error);n.classList.add("show");clearTimeout(noticeTimer);
+  noticeTimer=setTimeout(()=>n.classList.remove("show"),4200)}
+function agentAction(action,a,extra={}){
+  return {action,host:a.host,tty:a.tty,pid:a.pid,action_id:a.action_id,...extra}
+}
 async function refresh(force){
   try{
     const r=await fetch("/api/state?sort="+SORT); DATA=await r.json();
@@ -298,8 +344,7 @@ function inlineForm(key,kind,row,agent){
   const cancel=el("button","btn","Cancel");
   const done=()=>{delete forms[key];render(true)};
   send.onclick=()=>{const v=inp.value;done();
-    if(kind==="type"){if(v.trim())api({action:"type",host:agent.host,tty:agent.tty,
-      text:v.trim()})}
+    if(kind==="type"){if(v.trim())api(agentAction("type",agent,{text:v.trim()}))}
     else api({action:"nudge",host:row.host,path:row.path,text:v.trim()})};
   cancel.onclick=done;
   inp.onkeydown=e=>{if(e.key==="Enter")send.onclick();
@@ -335,7 +380,7 @@ function detail(row,key){
     } else if(!a.web&&!a.protected){
       const bp=el("button","btn hot","Prod");
       bp.onclick=e=>{e.stopPropagation();
-        api({action:"prod",host:a.host,tty:a.tty})};
+        api(agentAction("prod",a))};
       const bt=el("button","btn","Type…");
       bt.onclick=e=>{e.stopPropagation();forms[key]={kind:"type",tty:a.tty};render(true)};
       line.append(bp,bt);
@@ -344,14 +389,14 @@ function detail(row,key){
         bo.onclick=e=>{e.stopPropagation();
           if(confirm("Reopen "+a.name+" in a new window? Kills the detached "
             +"session and resumes it."))
-            api({action:"reopen",host:a.host,tty:a.tty})};
+            api(agentAction("reopen",a))};
         line.appendChild(bo);
       }
       const bx=el("button","btn danger","Close");
       bx.onclick=e=>{e.stopPropagation();
         if(confirm("Close "+a.name+" (pid "+a.pid+")? Resume info is saved to "
           +"closed-agents.md first."))
-          api({action:"close",host:a.host,tty:a.tty})};
+          api(agentAction("close",a))};
       line.appendChild(bx);
     }
     d.appendChild(line);
@@ -394,7 +439,7 @@ function renderLab(d){
       track.appendChild(fill);
       const sub=el("div","sub");
       sub.append(el("span","","n="+r.sent),
-        el("span","g","✓ "+r.productive+" worked"),
+        el("span","g","✓ "+r.productive+" file activity"),
         el("span","r","· "+r.restalled+" stuck"),
         el("span","d","· "+r.dropped+" left"));
       bar.append(top,track,sub);board.appendChild(bar);
@@ -421,6 +466,53 @@ function renderLab(d){
     ev.appendChild(row);
   });
 }
+function taskForm(){
+  const holder=$("#taskform");holder.textContent="";
+  const form=el("div","task-form");
+  const title=el("input");title.placeholder="What do you want to make, fix, or verify?";
+  const project=document.createElement("select");
+  const rows=(DATA&&DATA.rows)||[];
+  rows.forEach(r=>{const o=document.createElement("option");o.value=r.host+"\u0000"+r.path;
+    o.textContent=r.name+" · "+r.host;project.appendChild(o)});
+  const criteria=document.createElement("textarea");
+  criteria.placeholder="Acceptance criteria — one per line (for example: checkout works on mobile)";
+  const create=el("button","btn hot","Create task");
+  const cancel=el("button","btn","Cancel");
+  create.onclick=()=>{const parts=project.value.split("\u0000");if(!title.value.trim()||parts.length!==2){
+      notice("Choose a project and describe the task",true);return}
+    api({action:"task_create",host:parts[0],path:parts[1],title:title.value.trim(),
+      acceptance:criteria.value.split("\n").map(x=>x.trim()).filter(Boolean)}).then(ok=>{if(ok)holder.textContent=""})};
+  cancel.onclick=()=>{holder.textContent=""};
+  form.append(title,project,create,criteria,cancel);holder.appendChild(form);title.focus()
+}
+function taskCard(task){
+  const card=el("article","task");
+  card.append(el("div","task-title",task.title));
+  card.append(el("div","task-meta",task.project_path));
+  if(task.acceptance&&task.acceptance.length){const list=el("ul","task-criteria");
+    task.acceptance.slice(0,3).forEach(c=>list.appendChild(el("li","",c)));card.appendChild(list)}
+  if(task.latest_check){card.append(el("div","task-meta","latest check: "+task.latest_check.status+
+    (task.latest_check.name?" · "+task.latest_check.name:"")))}
+  const actions=el("div","task-actions");
+  const set=(status,label)=>{const b=el("button","btn",label);b.onclick=()=>api({action:"task_status",task_id:task.id,status});actions.appendChild(b)};
+  if(task.status==="planned")set("in_progress","Start");
+  if(task.status==="in_progress"){set("blocked","Need input");set("needs_review","Ready to review")}
+  if(task.status==="blocked")set("in_progress","Resume");
+  if(task.status==="needs_review"){const verify=el("button","btn hot","Verify");
+    verify.onclick=()=>api({action:"task_verify",task_id:task.id});actions.appendChild(verify);set("done","Mark done")}
+  card.appendChild(actions);return card
+}
+function renderWorkbench(d){
+  const queues=$("#taskqueues");queues.textContent="";
+  const wb=d.workbench||{queues:{needs_you:[],working:[],ready:[]}};
+  [["needs_you","Needs you","Nothing waiting for a decision."],
+   ["working","Working","No active tasks yet."],
+   ["ready","Ready to review","Nothing ready to verify."]].forEach(([key,label,empty])=>{
+    const q=el("section","queue");q.appendChild(el("h3","",label));
+    const tasks=(wb.queues&&wb.queues[key])||[];
+    if(!tasks.length)q.appendChild(el("div","queue-empty",empty));
+    tasks.forEach(t=>q.appendChild(taskCard(t)));queues.appendChild(q)})
+}
 function render(force){
   if(!DATA||typingNow())return;
   // never reshuffle rows under the pointer — a click must not land on a row
@@ -441,9 +533,11 @@ function render(force){
   if(d.stalled_count){const s=el("span","stalled",
     "  ·  "+d.stalled_count+" stalled");st.appendChild(s)}
   $("#autoswitch").classList.toggle("on",d.auto_prod);
+  $("#autoswitch").setAttribute("aria-checked",String(!!d.auto_prod));
   const t=$("#ticker");t.textContent=d.msgs.length?d.msgs[d.msgs.length-1]:"";
   const lg=$("#log");lg.textContent="";
   [...d.msgs].reverse().forEach(m=>lg.appendChild(el("div","",m)));
+  renderWorkbench(d);
   renderLab(d);
   const list=$("#list");list.textContent="";
   if(!d.rows.length){list.appendChild(el("div","empty","waiting for first scan…"));
@@ -451,7 +545,9 @@ function render(force){
   d.rows.forEach(row=>{
     const key=row.host+"|"+row.path;
     const card=el("div","card");
-    const main=el("div","rowmain");
+    const main=el("div","rowmain");main.tabIndex=0;main.setAttribute("role","button");
+    main.setAttribute("aria-expanded",String(open.has(key)));
+    main.setAttribute("aria-label","Show details for "+row.name);
     const pn=el("div","pname");
     pn.append(el("span","nm",row.name),el("span","host",row.host));
     const mode=el("button","mode"+(row.mode==="PROD"?" prod":""),row.mode);
@@ -474,7 +570,9 @@ function render(force){
     lf.append(document.createTextNode(row.latest_file+" "),
       el("span","","("+fmtAge(row.latest_age)+" ago)"));
     main.append(pn,mode,ag,counts,spark(row.buckets),lf);
-    main.onclick=()=>{open.has(key)?open.delete(key):open.add(key);render(true)};
+    const toggle=()=>{open.has(key)?open.delete(key):open.add(key);render(true)};
+    main.onclick=toggle;
+    main.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle()}};
     card.appendChild(main);
     if(open.has(key))card.appendChild(detail(row,key));
     list.appendChild(card);
@@ -485,7 +583,10 @@ $("#sortseg").onclick=e=>{const b=e.target.closest("button");if(!b)return;
   $("#sortseg").querySelectorAll("button").forEach(x=>
     x.classList.toggle("on",x===b));
   refresh()};
-$("#autoswitch").onclick=()=>api({action:"autoprod",value:!DATA.auto_prod});
+$("#autoswitch").onclick=()=>{const next=!DATA.auto_prod;
+  if(next&&!confirm("Turn on automatic nudging? Prodder will only nudge quiet, unchanged, non-protected agent screens, but this can still spend tokens."))return;
+  api({action:"autoprod",value:next})};
+$("#newtask").onclick=()=>taskForm();
 $("#logbtn").onclick=()=>$("#log").classList.toggle("show");
 $("#ticker").onclick=()=>$("#log").classList.toggle("show");
 $("#labbtn").onclick=()=>{$("#lab").classList.toggle("show");

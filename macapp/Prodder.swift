@@ -69,8 +69,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let u = URL(string: baseURL + "/api/state") else { return false }
         var req = URLRequest(url: u); req.timeoutInterval = 1
         let sem = DispatchSemaphore(value: 0); var up = false
-        URLSession.shared.dataTask(with: req) { d, _, _ in
-            up = (d != nil); sem.signal()
+        URLSession.shared.dataTask(with: req) { d, response, _ in
+            defer { sem.signal() }
+            // A service merely listening on 8737 is not necessarily Prodder.
+            // Require the small stable shape of its state document before we
+            // attach the native controls to it.
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let d = d,
+                  let state = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  state["agent_count"] is Int,
+                  state["rows"] is [Any]
+            else { return }
+            up = true
         }.resume()
         _ = sem.wait(timeout: .now() + 1.5)
         return up

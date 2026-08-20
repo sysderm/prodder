@@ -24,6 +24,17 @@ nudge = "continue"     # fallback nudge (used if nudge_pool is empty)
 # rows are shown but never auto-prodded; you can still Type… into them by hand.
 show_all_terminals = true
 
+# Terminal tails saved by Close/Reopen are owner-only and redact these common
+# credential patterns before they reach closed-agents.md. Add internal token
+# prefixes here if your environment uses them. Set [] only if you deliberately
+# need unredacted local history.
+history_redact_patterns = [
+  "\\bAKIA[0-9A-Z]{16}\\b",
+  "\\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\\b",
+  "\\bsk-[A-Za-z0-9_-]{16,}\\b",
+  "(?i)(?:authorization\\s*:\\s*bearer|bearer|api[_ -]?key|password|secret)\\s*[:=]?\\s*[^\\s`'\\\"]+",
+]
+
 # Nudge experiment. prodder rotates through nudge_pool with an epsilon-greedy
 # bandit — mostly sending whatever phrasing has best resumed real work, but
 # exploring the rest — and logs each prod's outcome (did the project produce
@@ -105,6 +116,13 @@ notify_active_window = 300
 
 [web]
 port = 8737            # the dashboard listens on 127.0.0.1:<port> (never public)
+
+[workbench]
+# The dashboard's Verify action always records read-only Git evidence. It runs
+# project commands only when you explicitly list them here; commands use no
+# shell and run from the task's configured local project root.
+check_commands = []    # e.g. ["pytest -q", "npm run lint", "npm test"]
+check_timeout = 300    # seconds per configured command (max 1800)
 
 # Name each host however you like, but if you use Tailscale the node name is a
 # tidy convention (it already matches your ssh targets).

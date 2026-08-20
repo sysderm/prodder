@@ -1,24 +1,28 @@
 """Locale robustness: on a comma-decimal locale (de_DE, fr_FR, …) `ps` prints
 pcpu as "0,4", and a bare float() would throw and drop every agent. pfloat is
-the parse-side belt to the LC_ALL=C suspenders in the scan subprocesses."""
-import pytest
+the parse-side belt to the LC_ALL=C suspenders in the scan subprocesses.
 
-import prodtop
+Stdlib only (unittest) — no third-party deps, so CI needs no install step."""
+import os
+import sys
+import unittest
 
-
-@pytest.mark.parametrize("text,expected", [
-    ("0.4", 0.4),      # normal dot decimal (LC_ALL=C output)
-    ("0,4", 0.4),      # comma decimal (de_DE/fr_FR ps output)
-    ("12,5", 12.5),
-    ("100", 100.0),    # integer, no separator
-    ("0", 0.0),
-])
-def test_pfloat_parses(text, expected):
-    assert prodtop.pfloat(text) == expected
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import prodtop  # noqa: E402
 
 
-@pytest.mark.parametrize("bad", ["abc", "", "1,2,3"])
-def test_pfloat_rejects_garbage(bad):
-    # Must raise like float() so the caller's `except ValueError` still fires.
-    with pytest.raises(ValueError):
-        prodtop.pfloat(bad)
+class Pfloat(unittest.TestCase):
+    def test_parses_dot_comma_and_int(self):
+        cases = {"0.4": 0.4, "0,4": 0.4, "12,5": 12.5, "100": 100.0, "0": 0.0}
+        for text, expected in cases.items():
+            self.assertEqual(prodtop.pfloat(text), expected, text)
+
+    def test_rejects_garbage_like_float(self):
+        # Must raise ValueError so callers' `except ValueError` still fires.
+        for bad in ("abc", "", "1,2,3"):
+            with self.assertRaises(ValueError, msg=bad):
+                prodtop.pfloat(bad)
+
+
+if __name__ == "__main__":
+    unittest.main()

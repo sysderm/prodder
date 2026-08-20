@@ -28,6 +28,7 @@ try:
 except ImportError:                     # pragma: no cover
     curses = None
 import fnmatch
+import hashlib
 import http.server
 import json
 import os
@@ -57,6 +58,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from prodder_workbench import EVENT_TYPES, WorkspaceStore, WorkbenchError
+
+try:                                    # Prodder supports POSIX hosts only.
+    import fcntl
+except ImportError:                     # pragma: no cover - defensive only
+    fcntl = None
+
 __version__ = "0.1.0"
 
 IS_MAC = sys.platform == "darwin"
@@ -64,6 +72,71 @@ IS_MAC = sys.platform == "darwin"
 SPARK_CHARS = " ▁▂▃▄▅▆▇█"
 SPARK_BUCKETS = 24          # 24 x 1h sparkline
 MAX_RECENT_FILES = 12
+
+
+class ActionError(Exception):
+    """A safe, user-facing refusal from the local action API."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _atomic_write(path, text, mode=0o600):
+    """Durably replace a small private runtime file without a torn-write window."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, mode)            # retain privacy when replacing an old file
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _append_private(path, text, mode=0o600):
+    """Append audit/history text with owner-only permissions and an fsync."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, mode)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, text.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_private_json(path, value):
+    _atomic_write(path, json.dumps(value, indent=1) + "\n")
+
+
+def acquire_instance_lock(cfg):
+    """Keep one dashboard engine per configuration directory.
+
+    flock is released automatically if this process crashes, unlike a PID file.
+    The lock file deliberately remains as a private stable inode for future runs.
+    """
+    if fcntl is None:
+        return None
+    path = Path(cfg["_dir"]) / "prodder.lock"
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise ActionError(409, "prodder is already running for this configuration")
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
 
 SSH_BASE = [
     "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -488,6 +561,26 @@ class AgentProc:
     def eff_idle(self):
         return self.idle + (time.time() - self.scanned_at) if self.idle >= 0 else -1.0
 
+    @property
+    def action_id(self):
+        """Stable snapshot binding for a destructive/manual UI action.
+
+        A tty is reusable.  Pairing it with the process and session identity
+        lets the server refuse a click that was rendered for an older occupant.
+        """
+        raw = "\0".join((self.host, str(self.pid), self.tty, self.name,
+                         self.cwd, self.tmux, self.pane))
+        return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def action_target_matches(agent, pid, action_id):
+    """True only when an action still names the exact scanned agent."""
+    try:
+        return (agent.pid == int(pid)
+                and secrets.compare_digest(agent.action_id, str(action_id or "")))
+    except (TypeError, ValueError):
+        return False
+
 
 @dataclass
 class Project:
@@ -592,8 +685,30 @@ def load_config(path):
     # never hides in a window prodder didn't list. These extra rows are shown
     # but never auto-prodded (they're plain shells until proven otherwise).
     a.setdefault("show_all_terminals", True)
+    # Closing an agent stores the visible terminal tail locally.  These cover
+    # common credential shapes while allowing installations to add their own
+    # patterns (for example an internal token prefix).
+    a.setdefault("history_redact_patterns", [
+        r"\bAKIA[0-9A-Z]{16}\b",                  # AWS access key IDs
+        r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b",
+        r"\bsk-[A-Za-z0-9_-]{16,}\b",
+        r"(?i)(?:authorization\s*:\s*bearer|bearer|api[_ -]?key|password|secret)"
+        r"\s*[:=]?\s*[^\s`'\"]+",
+    ])
     w = cfg.setdefault("web", {})
     w.setdefault("port", 8737)
+    wb = cfg.setdefault("workbench", {})
+    # Commands are opt-in: Prodder never guesses how to execute an unfamiliar
+    # project.  Put vetted commands such as "pytest -q" here to enable the
+    # explicit Verify action for local tasks.
+    wb.setdefault("check_commands", [])
+    wb.setdefault("check_timeout", 300)
+    if (not isinstance(wb["check_commands"], list)
+            or not all(isinstance(command, str) and command.strip()
+                       for command in wb["check_commands"])):
+        sys.exit("prodder: [workbench] check_commands must be a list of commands")
+    if not isinstance(wb["check_timeout"], (int, float)) or wb["check_timeout"] <= 0:
+        sys.exit("prodder: [workbench] check_timeout must be a positive number")
     cfg["hosts"] = [h for h in cfg.get("hosts", []) if h.get("enabled", True)]
     for i, h in enumerate(cfg["hosts"]):
         # Validate up front with a friendly message, instead of a KeyError
@@ -618,8 +733,11 @@ def load_config(path):
 
 def load_state(cfg):
     """(policies, nudges) from prodtop-state.json."""
+    path = Path(cfg["_dir"]) / "prodtop-state.json"
     try:
-        with open(Path(cfg["_dir"]) / "prodtop-state.json") as f:
+        # Tighten permissions on runtime state created by older Prodder releases.
+        os.chmod(path, 0o600)
+        with open(path) as f:
             d = json.load(f)
             return d.get("policies", {}), d.get("nudges", {})
     except (OSError, ValueError):
@@ -628,10 +746,11 @@ def load_state(cfg):
 
 def save_state(cfg, policies, nudges):
     try:
-        with open(Path(cfg["_dir"]) / "prodtop-state.json", "w") as f:
-            json.dump({"policies": policies, "nudges": nudges}, f, indent=1)
+        _write_private_json(Path(cfg["_dir"]) / "prodtop-state.json",
+                            {"policies": policies, "nudges": nudges})
     except OSError:
-        pass
+        return False
+    return True
 
 
 def match_policy(host, path, policies, default="auto"):
@@ -1936,6 +2055,17 @@ class SafeStaleTracker:
         return sample["fingerprint"] if sample else ""
 
 
+def redact_history(text, patterns):
+    """Remove likely credentials from terminal history before it reaches disk."""
+    for pattern in patterns:
+        try:
+            text = re.sub(pattern, "[REDACTED]", text, flags=re.IGNORECASE)
+        except re.error:
+            # A malformed user-supplied pattern must never block a safe close.
+            continue
+    return text
+
+
 def close_agent(agent, cfg):
     """Save resume command + screen tail to closed-agents.md, then terminate.
     Orphaned asciinema wrappers (window already gone) are killed along with
@@ -1945,6 +2075,7 @@ def close_agent(agent, cfg):
     screen = capture_screen(agent)
     tail = "\n".join(l.rstrip() for l in screen.splitlines() if l.strip())
     tail = "\n".join(tail.splitlines()[-40:])
+    tail = redact_history(tail, cfg["agents"].get("history_redact_patterns", []))
     resume = find_resume(agent)
 
     m = ps_map() if not agent.ssh else {}
@@ -1964,24 +2095,22 @@ def close_agent(agent, cfg):
     detached = wrap_idx is not None and chain[wrap_idx][1] <= 1
 
     log = Path(cfg["_dir"]) / "closed-agents.md"
-    with open(log, "a") as f:
-        f.write(f"\n## {time.strftime('%Y-%m-%d %H:%M')} — {agent.name} "
-                f"in {agent.cwd or '?'} ({agent.host})\n\n")
-        f.write(f"- pid {agent.pid}, tty {agent.tty}, "
-                f"idle {fmt_age(agent.eff_idle())}"
-                + (f", tmux {agent.tmux}" if agent.tmux else "")
-                + (", window already closed (detached)" if detached else "") + "\n")
-        if resume:
-            f.write(f"- **resume:** `{resume[0]}`\n")
-            f.write(f"- session file: `{resume[1]}`\n")
-        else:
-            f.write("- resume command not found"
-                    + (" (remote host — look on that machine)" if agent.ssh else "")
-                    + "\n")
-        if cast:
-            f.write(f"- asciinema recording: `{cast}`\n")
-        if tail:
-            f.write(f"\n```text\n{tail}\n```\n")
+    entry = (f"\n## {time.strftime('%Y-%m-%d %H:%M')} — {agent.name} "
+             f"in {agent.cwd or '?'} ({agent.host})\n\n"
+             f"- pid {agent.pid}, tty {agent.tty}, idle {fmt_age(agent.eff_idle())}"
+             + (f", tmux {agent.tmux}" if agent.tmux else "")
+             + (", window already closed (detached)" if detached else "") + "\n")
+    if resume:
+        entry += f"- **resume:** `{resume[0]}`\n- session file: `{resume[1]}`\n"
+    else:
+        entry += ("- resume command not found"
+                  + (" (remote host — look on that machine)" if agent.ssh else "")
+                  + "\n")
+    if cast:
+        entry += f"- asciinema recording: `{cast}`\n"
+    if tail:
+        entry += f"\n```text\n{tail}\n```\n"
+    _append_private(log, entry)
 
     if agent.ssh:
         subprocess.run(SSH_BASE + [agent.ssh, f"kill {agent.pid} 2>/dev/null; true"],
@@ -2424,15 +2553,13 @@ class ProdLog:
 
     def _save_stats(self):
         try:
-            with open(self.stats_path, "w") as f:
-                json.dump(self.stats, f, indent=1)
+            _write_private_json(self.stats_path, self.stats)
         except OSError:
             pass
 
     def _append_event(self, ev):
         try:
-            with open(self.events_path, "a") as f:
-                f.write(json.dumps(ev) + "\n")
+            _append_private(self.events_path, json.dumps(ev) + "\n")
         except OSError:
             pass
 
@@ -3094,8 +3221,12 @@ def demo_config():
 
 def web(cfg, open_browser=True, demo=False):
     """Serve the dashboard on localhost and run the engine behind it."""
+    try:
+        lock_fd = acquire_instance_lock(cfg)
+    except ActionError as e:
+        sys.exit(f"prodder: {e.message}")
     eng = Engine(cfg, demo=demo)
-    eng.start()
+    workbench = WorkspaceStore(cfg["_dir"])
     agent_cfg = cfg["agents"]
     port = cfg["web"]["port"]
 
@@ -3107,20 +3238,6 @@ def web(cfg, open_browser=True, demo=False):
     # / CLI to read. Read-only /api/state stays open (Host + cross-site guarded).
     api_key = secrets.token_urlsafe(24)
     key_path = Path(cfg.get("_dir", ".")) / "prodder-token"
-    try:
-        # Create 0600 atomically — a write_text()+chmod sequence leaves a window
-        # where the token is world-readable (umask 0644) to other local users,
-        # and O_TRUNC alone would keep a stale file's loose perms. Unlink, then
-        # O_EXCL create guarantees a fresh owner-only file.
-        try:
-            os.unlink(str(key_path))
-        except FileNotFoundError:
-            pass
-        fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(api_key)
-    except OSError:
-        pass
 
     def snapshot(sort_by):
         projects, hosts, agents = gather_rows(
@@ -3135,6 +3252,7 @@ def web(cfg, open_browser=True, demo=False):
                 nxt = max(0, agent_cfg["prod_cooldown"] - (now - sent)) if sent else 0
                 arows.append({
                     "name": a.name, "pid": a.pid, "host": a.host, "tty": a.tty,
+                    "action_id": a.action_id,
                     "idle": round(a.eff_idle(), 1), "cpu": round(a.work_cpu),
                     "stalled": effective_stalled(a, agent_cfg["idle_after"]),
                     "policy": a.policy, "protected": a.protected,
@@ -3176,27 +3294,98 @@ def web(cfg, open_browser=True, demo=False):
             "msgs": list(eng.msgs), "default_nudge": agent_cfg["nudge"],
             "leaderboard": eng.prodlog.leaderboard(),
             "events": events,
+            "workbench": workbench.dashboard(),
+            "workbench_checks_configured": bool(cfg["workbench"]["check_commands"]),
         }
 
-    def find_agent(host, tty):
+    def find_agent(q):
+        """Find exactly the agent the browser snapshot described, never a tty alone."""
+        # Validate the request shape before scanning shared state. The real
+        # comparison below is made against the selected live agent.
+        try:
+            int(q.get("pid"))
+        except (TypeError, ValueError):
+            raise ActionError(400, "missing or invalid agent identity")
+        host, tty, action_id = q.get("host"), q.get("tty"), q.get("action_id")
         with eng.lock:
             for hs in eng.state.values():
                 for a in hs.agents:
-                    if a.host == host and a.tty == tty:
+                    if (a.host == host and a.tty == tty
+                            and action_target_matches(a, q.get("pid"), action_id)):
                         apply_policies([a], eng.policies)
                         return a
-        return None
+        raise ActionError(409, "agent changed or is gone — refresh before acting")
+
+    def validate_live_target(a):
+        """Close the scan-to-action race before injecting input or killing a PID."""
+        if a.web:
+            return
+        expected = (a.tty or "").removeprefix("/dev/")
+        try:
+            if a.ssh:
+                r = subprocess.run(SSH_BASE + [a.ssh, f"ps -o tty= -p {a.pid}"],
+                                   capture_output=True, text=True, timeout=15)
+            else:
+                r = subprocess.run(["ps", "-o", "tty=", "-p", str(a.pid)],
+                                   capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise ActionError(409, f"could not verify agent identity: {e}")
+        if r.returncode != 0 or r.stdout.strip() != expected:
+            raise ActionError(409, "agent changed or is gone — refresh before acting")
 
     KNOWN_ACTIONS = {"rescan", "autoprod", "mode", "nudge", "prod", "type",
-                     "close", "reopen", "feedback"}
+                     "close", "reopen", "feedback", "task_create", "task_status",
+                     "task_verify", "task_event"}
+
+    def is_local_project(host, path):
+        if not isinstance(host, str) or not isinstance(path, str):
+            return False
+        try:
+            candidate = Path(path).expanduser().resolve()
+        except OSError:
+            return False
+        for h in cfg["hosts"]:
+            if h.get("local") and h["name"] == host:
+                for root in h.get("roots", []):
+                    try:
+                        root_path = Path(root).expanduser().resolve()
+                        if candidate == root_path or candidate.is_relative_to(root_path):
+                            return True
+                    except OSError:
+                        continue
+        return False
 
     def do_action(q):
         act = q.get("action")
         if act not in KNOWN_ACTIONS:
-            return "unknown action"
+            raise ActionError(400, "unknown action")
         if act == "feedback":
             ok = eng.prodlog.feedback(str(q.get("id", "")), bool(q.get("good")))
-            return "thanks — recorded" if ok else "prod not found"
+            if not ok:
+                raise ActionError(404, "prod not found")
+            return "thanks — recorded"
+        if act == "task_create":
+            task = workbench.create_task(q.get("host"), q.get("path"), q.get("title"),
+                                         q.get("description", ""), q.get("acceptance", []))
+            return f"task created: {task['title']}"
+        if act == "task_status":
+            task = workbench.set_status(q.get("task_id"), q.get("status"))
+            return f"{task['title']}: {task['status'].replace('_', ' ')}"
+        if act == "task_event":
+            event_type = q.get("event_type")
+            if event_type not in EVENT_TYPES:
+                raise ActionError(400, "unknown workbench event type")
+            workbench.add_event("dashboard", event_type, q.get("task_id"),
+                                q.get("payload", {}))
+            return "event recorded"
+        if act == "task_verify":
+            task = workbench.get_task(q.get("task_id"))
+            if not is_local_project(task["host"], task["project_path"]):
+                raise ActionError(400, "verification is available only for configured local roots")
+            result = workbench.verify_task(task["id"], cfg["workbench"]["check_commands"],
+                                           cfg["workbench"]["check_timeout"])
+            failed = [c for c in result["checks"] if c["status"] == "failed"]
+            return ("verification needs attention" if failed else "verification recorded")
         if act == "rescan":
             eng.wake.set()
             return "rescanning"
@@ -3204,6 +3393,8 @@ def web(cfg, open_browser=True, demo=False):
             agent_cfg["auto_prod"] = bool(q.get("value"))
             return f"auto-prod {'on' if agent_cfg['auto_prod'] else 'off'}"
         if act == "mode":
+            if not isinstance(q.get("host"), str) or not isinstance(q.get("path"), str):
+                raise ActionError(400, "missing project identity")
             key = f"{q['host']}|{q['path']}"
             if q.get("value") == "ignore":
                 eng.policies[key] = "ignore"
@@ -3213,9 +3404,12 @@ def web(cfg, open_browser=True, demo=False):
                 if match_policy(q["host"], q["path"], eng.policies) != "auto":
                     eng.policies[key] = "auto"
                 msg = "MODE = PROD (stalled agents here get prodded)"
-            save_state(cfg, eng.policies, eng.nudges)
+            if not save_state(cfg, eng.policies, eng.nudges):
+                raise ActionError(500, "policy changed in memory but could not be saved")
             return f"{os.path.basename(q['path'])}: {msg}"
         if act == "nudge":
+            if not isinstance(q.get("host"), str) or not isinstance(q.get("path"), str):
+                raise ActionError(400, "missing project identity")
             key = f"{q['host']}|{q['path']}"
             txt = (q.get("text") or "").strip()
             if txt:
@@ -3224,13 +3418,13 @@ def web(cfg, open_browser=True, demo=False):
             else:
                 eng.nudges.pop(key, None)
                 msg = f"nudge reset to default '{agent_cfg['nudge']}'"
-            save_state(cfg, eng.policies, eng.nudges)
+            if not save_state(cfg, eng.policies, eng.nudges):
+                raise ActionError(500, "nudge changed in memory but could not be saved")
             return f"{os.path.basename(q['path'])}: {msg}"
-        a = find_agent(q.get("host"), q.get("tty"))
-        if a is None:
-            return "agent is gone — rescan"
+        a = find_agent(q)
         if eng.demo:                       # never touch the real system in a demo
             return eng.driver.act(act, a)
+        validate_live_target(a)
         if act == "prod":
             msg = experiment_prod(a, cfg, eng.nudges, eng.prodlog)
             if prod_succeeded(msg):
@@ -3259,7 +3453,7 @@ def web(cfg, open_browser=True, demo=False):
             eng.drop_agent(a)
             eng.wake.set()
             return msg
-        return "unknown action"
+        raise ActionError(400, "unknown action")
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -3286,6 +3480,16 @@ def web(cfg, open_browser=True, demo=False):
             self.send_header("Content-Type", ctype + "; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            # The page contains a capability token.  Prevent another site from
+            # framing it and turning an innocent click into an agent action.
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy",
+                             "default-src 'self'; connect-src 'self'; "
+                             "img-src 'self' data:; style-src 'unsafe-inline'; "
+                             "script-src 'unsafe-inline'; base-uri 'none'; "
+                             "form-action 'none'; frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(data)
 
@@ -3309,7 +3513,7 @@ def web(cfg, open_browser=True, demo=False):
         def do_POST(self):
             if not self._host_ok():
                 return
-            if self.path != "/api/action":
+            if self.path not in ("/api/action", "/api/events"):
                 return self._send(404, "not found", "text/plain")
             # same-origin only: browsers can't add this header cross-site
             # without a CORS preflight, which we never answer
@@ -3325,29 +3529,63 @@ def web(cfg, open_browser=True, demo=False):
                     api_key.encode()):
                 return self._send(403, "forbidden", "text/plain")
             try:
-                n = int(self.headers.get("Content-Length", 0))
-                q = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
-            except (ValueError, OSError):
+                n = int(self.headers.get("Content-Length", ""))
+                if not 0 < n <= 65536:
+                    raise ValueError
+                if "application/json" not in self.headers.get("Content-Type", ""):
+                    raise ValueError
+                q = json.loads(self.rfile.read(n))
+                if not isinstance(q, dict):
+                    raise ValueError
+            except (TypeError, ValueError, OSError, json.JSONDecodeError):
                 return self._send(400, "bad request", "text/plain")
+            if self.path == "/api/events":
+                try:
+                    event_type = q.get("type")
+                    if event_type not in EVENT_TYPES:
+                        raise WorkbenchError("unknown event type")
+                    event_id = workbench.add_event(q.get("source", "hook"), event_type,
+                                                   q.get("task_id"), q.get("payload", {}))
+                except WorkbenchError as e:
+                    return self._send(400, json.dumps({"ok": False, "msg": str(e)}))
+                return self._send(201, json.dumps({"ok": True, "id": event_id}))
             if q.get("action") == "quit":
-                self._send(200, json.dumps({"msg": "bye"}))
+                self._send(200, json.dumps({"ok": True, "msg": "bye"}))
                 threading.Thread(target=srv.shutdown, daemon=True).start()
                 return
             try:
                 msg = do_action(q)
-            except Exception as e:
-                msg = f"action failed: {str(e)[:120]}"
+            except ActionError as e:
+                return self._send(e.status, json.dumps({"ok": False, "msg": e.message}))
+            except WorkbenchError as e:
+                return self._send(400, json.dumps({"ok": False, "msg": str(e)}))
+            except Exception:
+                return self._send(500, json.dumps({"ok": False,
+                                                   "msg": "action failed; see local log"}))
             eng.msgs.append(f"[{time.strftime('%H:%M')}] {msg}")
-            self._send(200, json.dumps({"msg": msg}))
+            self._send(200, json.dumps({"ok": True, "msg": msg}))
 
     try:
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as e:
         eng.stop()
+        if lock_fd is not None:
+            os.close(lock_fd)
         sys.exit(f"prodder: can't bind 127.0.0.1:{port} ({e}). Is prodder "
                  f"already running? Pick another with --port <n>.")
+    try:
+        # Do this only after the instance owns its port.  A failed second launch
+        # can no longer rotate the token used by a healthy first instance.
+        _atomic_write(key_path, api_key)
+    except OSError as e:
+        srv.server_close()
+        eng.stop()
+        if lock_fd is not None:
+            os.close(lock_fd)
+        sys.exit(f"prodder: can't securely write {key_path}: {e}")
     url = f"http://127.0.0.1:{port}"
     print(f"prodder dashboard: {url}", file=sys.stderr)
+    eng.start()
     if open_browser:
         threading.Timer(0.4, webbrowser.open, [url]).start()
     try:
@@ -3357,6 +3595,8 @@ def web(cfg, open_browser=True, demo=False):
     finally:
         eng.stop()
         srv.server_close()
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def once(cfg):
@@ -3423,6 +3663,11 @@ def main():
     ap.add_argument("--demo", action="store_true",
                     help="run a self-contained demo with a simulated fleet — "
                          "no config, no ssh, nothing real is touched")
+    ap.add_argument("--emit-event", choices=sorted(EVENT_TYPES), metavar="TYPE",
+                    help="record a provider-neutral workbench event and exit")
+    ap.add_argument("--task-id", help="task ID for --emit-event")
+    ap.add_argument("--event-source", default="cli", help="event source label")
+    ap.add_argument("--event-payload", default="{}", help="JSON object for --emit-event")
     args = ap.parse_args()
     if args.demo:
         cfg = demo_config()
@@ -3461,7 +3706,15 @@ def main():
             ap.error(f"{args.config} not found; create it, pass --config, "
                      f"or try:  prodder --demo")
     cfg = load_config(args.config)
-    if args.test_remote:
+    if args.emit_event:
+        try:
+            payload = json.loads(args.event_payload)
+            event_id = WorkspaceStore(cfg["_dir"]).add_event(
+                args.event_source, args.emit_event, args.task_id, payload)
+        except (json.JSONDecodeError, WorkbenchError) as e:
+            ap.error(str(e))
+        print(event_id)
+    elif args.test_remote:
         test_remote(cfg)
     elif args.once:
         once(cfg)
