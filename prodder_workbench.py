@@ -98,6 +98,21 @@ class WorkspaceStore:
                 );
                 CREATE INDEX IF NOT EXISTS check_task_created
                     ON checks(task_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id TEXT PRIMARY KEY,
+                    host TEXT NOT NULL,
+                    tty TEXT NOT NULL DEFAULT '',
+                    pid INTEGER NOT NULL DEFAULT 0,
+                    agent TEXT NOT NULL DEFAULT '',
+                    question TEXT NOT NULL,
+                    options_json TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    resolved_at REAL,
+                    answer TEXT
+                );
+                CREATE INDEX IF NOT EXISTS decision_open
+                    ON decisions(resolved_at, created_at DESC);
             """)
             conn.commit()
         finally:
@@ -224,6 +239,94 @@ class WorkspaceStore:
             conn.close()
         return event_id
 
+    # -- decisions: pending human choices detected from an agent's screen -----
+    # These are the "needs a human, not a blind continue" items. Kept here so the
+    # dashboard, Telegram, and the auto-prod hold all read one durable source.
+
+    @staticmethod
+    def _decision(row):
+        d = dict(row)
+        d["options"] = json.loads(d.pop("options_json"))
+        return d
+
+    def add_decision(self, host, tty, pid, agent, question, options=None, source=""):
+        """Record a pending decision. Deduped per (host, tty): if an OPEN
+        decision with the same question already exists there, it is returned
+        unchanged. Returns (decision_id, created_new)."""
+        host = self._text(host, "host", 120)
+        question = self._text(question, "question", 4000)
+        tty, agent = str(tty or "")[:120], str(agent or "")[:120]
+        source = str(source or "")[:60]
+        opts = [str(o)[:120] for o in (options or [])][:12]
+        conn = self._connect()
+        try:
+            existing = conn.execute(
+                "SELECT id FROM decisions WHERE resolved_at IS NULL AND host=? "
+                "AND tty=? AND question=? LIMIT 1", (host, tty, question)).fetchone()
+            if existing:
+                return existing["id"], False
+            did, now = uuid.uuid4().hex, time.time()
+            conn.execute(
+                "INSERT INTO decisions (id, host, tty, pid, agent, question, "
+                "options_json, source, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (did, host, tty, int(pid or 0), agent, question,
+                 json.dumps(opts, separators=(",", ":")), source, now))
+            conn.commit()
+            return did, True
+        finally:
+            conn.close()
+
+    def open_decisions(self):
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM decisions WHERE resolved_at IS NULL "
+                "ORDER BY created_at DESC LIMIT 200").fetchall()
+            return [self._decision(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_decision(self, decision_id):
+        conn = self._connect()
+        try:
+            r = conn.execute("SELECT * FROM decisions WHERE id=?",
+                             (str(decision_id),)).fetchone()
+            return self._decision(r) if r else None
+        finally:
+            conn.close()
+
+    def resolve_decision(self, decision_id, answer=""):
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE decisions SET resolved_at=?, answer=? "
+                "WHERE id=? AND resolved_at IS NULL",
+                (time.time(), str(answer or "")[:400], str(decision_id)))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def sync_decisions(self, active_keys):
+        """Auto-resolve open decisions whose (host, tty) no longer shows a
+        decision this scan — the agent moved on or its window is gone — so the
+        queue reflects reality. `active_keys` is a set of (host, tty) tuples that
+        currently present a decision. Returns the number cleared."""
+        active = {(str(h), str(t)) for h, t in active_keys}
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, host, tty FROM decisions WHERE resolved_at IS NULL").fetchall()
+            gone = [r["id"] for r in rows if (r["host"], r["tty"]) not in active]
+            now = time.time()
+            for did in gone:
+                conn.execute("UPDATE decisions SET resolved_at=?, answer=? WHERE id=?",
+                             (now, "(cleared — no longer on screen)", did))
+            conn.commit()
+            return len(gone)
+        finally:
+            conn.close()
+
     def list_tasks(self, limit=100):
         conn = self._connect()
         try:
@@ -339,4 +442,5 @@ class WorkspaceStore:
                 "ready": [t for t in tasks if t["status"] == "needs_review"],
             },
             "recent_events": self.recent_events(12),
+            "decisions": self.open_decisions(),
         }

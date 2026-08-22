@@ -1556,6 +1556,40 @@ def extract_menu(screen):
     return "\n".join(lines[start:hits[-1] + 2])[-1500:], opts
 
 
+# A short question at the very end of the screen — an open-ended ask the agent
+# is waiting on ("which framework do you want?", "shall I delete the old file?").
+QUESTION_TAIL_RX = re.compile(r"(?:^|\n)\s*([^\n?]{6,180}\?)\s*$")
+
+
+def classify_decision(agent, screen, agent_cfg):
+    """Broad detection of a screen that needs a HUMAN decision — something that
+    must NOT get a blind 'continue'. Returns (question, options, source) or None,
+    most-specific first. A plain 'done' summary is deliberately NOT a decision
+    (it still gets the gentle reassess nudge); only a finished screen that ends
+    in an actual question counts."""
+    if not screen:
+        return None
+    menu, opts = extract_menu(screen)
+    if menu:
+        return menu.strip()[-1500:], opts, "menu"
+    tail = "\n".join(l.strip() for l in ANSI_RX.sub("", screen).splitlines()
+                     if l.strip())[-1500:]
+    if PROMPT_RX.search(tail):
+        low = tail.lower()
+        hit = [p for p in agent_cfg.get("never_approve", ()) if p.lower() in low]
+        if hit:
+            return (f"proposes a command matching never_approve "
+                    f"({', '.join(hit)[:80]}) — approve?"), ["yes", "no"], "never_approve"
+        return "agent is asking to run a command — approve?", ["yes", "no"], "approval"
+    # A stalled agent whose screen ENDS in a question is almost always waiting on
+    # you. Broad by design (the user picked "err toward asking"); skip only when
+    # the tail still looks like active work so a mid-thought "…?" isn't flagged.
+    m = QUESTION_TAIL_RX.search(tail)
+    if m and not BUSY_SCREEN_RX.search(tail[-200:]):
+        return m.group(1).strip(), [], "question"
+    return None
+
+
 def tg_api(token, method, payload=None, timeout=35):
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/{method}",
@@ -2765,6 +2799,13 @@ class AutoProdder(threading.Thread):
         self.stale_tracker = SafeStaleTracker()
         self.recovery_attempts = {}
         self.stopping = threading.Event()
+        # Decisions queue: a quiet agent whose screen needs a HUMAN choice is
+        # recorded (durably, in the workbench store) and held out of auto-prod —
+        # never blindly "continue"d. Detection runs every loop even when
+        # auto_prod is off, so the dashboard's "Needs you" list works standalone.
+        self.workbench = WorkspaceStore(cfg["_dir"])
+        self._dec_check = {}        # (host,tty) -> last screen-check time
+        self._open_dec_keys = set() # (host,tty) currently presenting a decision
 
     def stop(self):
         self.stopping.set()
@@ -2783,15 +2824,54 @@ class AutoProdder(threading.Thread):
         self.prodlog.resolve(proj_mtime, live, now,
                              self.cfg["agents"].get("outcome_window", 240))
 
+    def _detect_decisions(self, agents):
+        """Find quiet agents whose screen needs a human choice, record them in
+        the decisions queue, and hold them out of auto-prod. Per-agent screen
+        checks are throttled; only agents that have gone quiet are captured."""
+        now, acfg = time.time(), self.cfg["agents"]
+        quiet_after = acfg.get("safe_stale_after", 20)
+        active = set()
+        for a in agents:
+            if a.web or a.protected or a.policy == "ignore" or not a.recognized:
+                continue
+            key = (a.host, a.tty)
+            if a.eff_idle() < quiet_after:      # still moving — not waiting on you
+                continue
+            if now - self._dec_check.get(key, 0) < 30:
+                if key in self._open_dec_keys:  # keep the hold without re-capturing
+                    active.add(key)
+                    self.pending_remote[key] = now
+                continue
+            self._dec_check[key] = now
+            try:
+                found = classify_decision(a, capture_screen(a), acfg)
+            except (OSError, subprocess.SubprocessError):
+                found = None
+            if found:
+                question, options, source = found
+                try:
+                    self.workbench.add_decision(a.host, a.tty, a.pid, a.name,
+                                                question, options, source)
+                except WorkbenchError:
+                    pass
+                active.add(key)
+                self.pending_remote[key] = now  # never auto-continue a decision
+        self._open_dec_keys = active
+        try:
+            self.workbench.sync_decisions(active)   # clear resolved / gone ones
+        except Exception:
+            pass
+
     def run(self):
         agent_cfg, remote_cfg = self.cfg["agents"], self.cfg["remote"]
         while not self.stopping.is_set():
             try:
                 self._resolve_outcomes(time.time())
+                with self.state_lock:
+                    agents = [a for hs in self.state.values() for a in hs.agents]
+                    apply_policies(agents, self.policies)
+                self._detect_decisions(agents)      # always — even if auto_prod off
                 if agent_cfg["auto_prod"]:
-                    with self.state_lock:
-                        agents = [a for hs in self.state.values() for a in hs.agents]
-                        apply_policies(agents, self.policies)
                     auto_prod_pass(agents, agent_cfg, self.last_prod, self.msgs,
                                    self.pending_remote, remote_cfg["remote_timeout"],
                                    self.nudges, self.stale_tracker,
@@ -3335,7 +3415,7 @@ def web(cfg, open_browser=True, demo=False):
 
     KNOWN_ACTIONS = {"rescan", "autoprod", "mode", "nudge", "prod", "type",
                      "close", "reopen", "feedback", "task_create", "task_status",
-                     "task_verify", "task_event"}
+                     "task_verify", "task_event", "answer_decision"}
 
     def is_local_project(host, path):
         if not isinstance(host, str) or not isinstance(path, str):
@@ -3386,6 +3466,30 @@ def web(cfg, open_browser=True, demo=False):
                                            cfg["workbench"]["check_timeout"])
             failed = [c for c in result["checks"] if c["status"] == "failed"]
             return ("verification needs attention" if failed else "verification recorded")
+        if act == "answer_decision":
+            dec = workbench.get_decision(q.get("decision_id"))
+            if not dec or dec.get("resolved_at"):
+                raise ActionError(404, "decision not found or already answered")
+            answer = str(q.get("answer") or "").strip()
+            if not answer:
+                raise ActionError(400, "no answer given")
+            with eng.lock:
+                a = next((x for hs in eng.state.values() for x in hs.agents
+                          if x.host == dec["host"] and x.tty == dec["tty"]), None)
+            if a is None:
+                workbench.resolve_decision(dec["id"], answer + " (agent gone)")
+                return "agent no longer present — decision closed"
+            # "esc" backs out of a menu; anything else is typed and submitted.
+            if answer.lower() in ("esc", "escape"):
+                err = send_to_terminal(a, "\x1b", submit=False)
+            else:
+                err = send_to_terminal(a, answer, submit=True)
+            if err:
+                raise ActionError(502, f"answer not delivered: {err}")
+            workbench.resolve_decision(dec["id"], answer)
+            eng.pending_remote.pop((dec["host"], dec["tty"]), None)
+            eng.last_prod[(a.host, a.pid)] = time.time()
+            return f'answered "{answer[:40]}" to {a.name}'
         if act == "rescan":
             eng.wake.set()
             return "rescanning"

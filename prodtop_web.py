@@ -220,6 +220,28 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
   .counts,.spark,.lastf,.listhead{display:none}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;
   transition:none!important;scroll-behavior:auto!important}}
+.needsyou{border:1px solid var(--accent);
+  box-shadow:0 0 0 1px var(--accent),0 8px 30px rgba(240,134,45,.18);
+  animation:nypop .25s ease}
+@keyframes nypop{from{transform:translateY(-6px);opacity:.35}to{transform:none;opacity:1}}
+.needsyou-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 16px 0}
+.ny-bell{font-size:18px}
+.needsyou-head h2{font-size:16px;color:var(--accent2)}
+.needsyou-head p{color:var(--ink2);font-size:12px;flex:1;min-width:200px}
+#decision-list{display:flex;flex-direction:column;gap:10px;padding:12px 16px 16px}
+.decision{border:1px solid var(--line);border-radius:10px;padding:12px;
+  background:rgba(0,0,0,.18)}
+.decision .who{font-size:12px;color:var(--ink3);display:flex;gap:8px;
+  align-items:center;margin-bottom:6px;flex-wrap:wrap}
+.decision .src{font-size:10px;text-transform:uppercase;letter-spacing:.5px;
+  border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:var(--ink2)}
+.decision .q{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+  color:var(--ink);white-space:pre-wrap;max-height:150px;overflow:auto;
+  background:rgba(0,0,0,.25);border-radius:8px;padding:8px 10px;margin-bottom:8px}
+.decision .ans{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.decision .ans input{flex:1;min-width:120px;font:inherit;font-size:13px;color:var(--ink);
+  background:rgba(0,0,0,.3);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
+.decision .ans input:focus{outline:none;border-color:var(--accent)}
 </style></head><body>
 <header>
   <div class="logo">
@@ -247,6 +269,13 @@ main{max-width:1180px;margin:18px auto 80px;padding:0 20px;display:flex;
 </header>
 <div id="ticker"></div>
 <main>
+  <section class="panel needsyou" id="decisions" hidden aria-live="polite">
+    <div class="needsyou-head"><span class="ny-bell">🔔</span>
+      <h2 id="ny-title">Needs you</h2>
+      <p>Agents waiting on a real decision — answer here or from Telegram.
+         These are never auto-continued.</p></div>
+    <div id="decision-list"></div>
+  </section>
   <section class="panel workbench" id="workbench" aria-labelledby="workbench-title">
     <div class="workbench-head">
       <div><h2 id="workbench-title">Build with intent</h2><p>Define what good looks like, then verify before you ship.</p></div>
@@ -529,6 +558,35 @@ function renderWorkbench(d){
     if(!tasks.length)q.appendChild(el("div","queue-empty",empty));
     tasks.forEach(t=>q.appendChild(taskCard(t)));queues.appendChild(q)})
 }
+async function answerDecision(id,answer){
+  if(!answer)return;
+  await api({action:"answer_decision",decision_id:id,answer:answer});
+}
+function renderDecisions(d){
+  const panel=$("#decisions"),list=$("#decision-list");
+  const items=(d.workbench&&d.workbench.decisions)||[];
+  if(!items.length){panel.hidden=true;list.textContent="";return}
+  panel.hidden=false;$("#ny-title").textContent="Needs you ("+items.length+")";
+  list.textContent="";
+  const now=Date.now()/1000;
+  items.forEach(dec=>{
+    const c=el("div","decision");
+    const who=el("div","who");
+    who.append(el("span","src",dec.source||"decision"),
+      document.createTextNode((dec.agent||"agent")+" · "+dec.host
+        +(dec.tty?" · "+dec.tty:"")+" · "+fmtAge(now-dec.created_at)+" ago"));
+    c.append(who,el("div","q",dec.question));
+    const ans=el("div","ans");
+    (dec.options||[]).forEach(o=>{
+      const b=el("button","btn hot",o);b.onclick=()=>answerDecision(dec.id,o);
+      ans.appendChild(b)});
+    const esc=el("button","btn","esc");esc.onclick=()=>answerDecision(dec.id,"esc");
+    const inp=el("input");inp.placeholder="type an answer…";
+    inp.onkeydown=e=>{if(e.key==="Enter")answerDecision(dec.id,inp.value.trim())};
+    const send=el("button","btn","Send");send.onclick=()=>answerDecision(dec.id,inp.value.trim());
+    ans.append(esc,inp,send);c.appendChild(ans);
+    list.appendChild(c)});
+}
 function render(force){
   if(!DATA||typingNow())return;
   // never reshuffle rows under the pointer — a click must not land on a row
@@ -553,6 +611,7 @@ function render(force){
   const t=$("#ticker");t.textContent=d.msgs.length?d.msgs[d.msgs.length-1]:"";
   const lg=$("#log");lg.textContent="";
   [...d.msgs].reverse().forEach(m=>lg.appendChild(el("div","",m)));
+  renderDecisions(d);
   renderWorkbench(d);
   renderLab(d);
   const list=$("#list");list.textContent="";
